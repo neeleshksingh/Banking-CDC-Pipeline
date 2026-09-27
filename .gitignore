@@ -17,6 +17,7 @@ banking_dbt/target/
 banking_dbt/tests/
 
 .env
+.venv
 __pycache__/
 *.pyc
 .vscode/
