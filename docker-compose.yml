@@ -91,26 +91,35 @@ services:
       dockerfile: dockerfile-airflow.dockerfile
     container_name: airflow-webserver
     restart: always
+
+    env_file:
+      - ./docker/dags/.env
+
     depends_on:
       - airflow-scheduler
       - airflow-postgres
+
     environment:
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB_NAME}
 
+      # MinIO
       - MINIO_ENDPOINT=${MINIO_ENDPOINT}
       - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
       - MINIO_BUCKET=${MINIO_BUCKET}
       - MINIO_LOCAL_DIR=${MINIO_LOCAL_DIR}
+
     volumes:
       - ./docker/dags:/opt/airflow/dags
       - ./docker/logs:/opt/airflow/logs
       - ./docker/plugins:/opt/airflow/plugins
       - ./banking_dbt:/opt/airflow/banking_dbt
       - ./banking_dbt/.dbt:/home/airflow/.dbt
+
     ports:
       - "8080:8080"
+
     command: webserver
 
   airflow-scheduler:
@@ -119,8 +128,13 @@ services:
       dockerfile: dockerfile-airflow.dockerfile
     container_name: airflow-scheduler
     restart: always
+
+    env_file:
+      - ./docker/dags/.env
+
     depends_on:
       - airflow-postgres
+
     environment:
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB_NAME}
@@ -130,12 +144,14 @@ services:
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
       - MINIO_BUCKET=${MINIO_BUCKET}
       - MINIO_LOCAL_DIR=${MINIO_LOCAL_DIR}
+
     volumes:
       - ./docker/dags:/opt/airflow/dags
       - ./docker/logs:/opt/airflow/logs
       - ./docker/plugins:/opt/airflow/plugins
       - ./banking_dbt:/opt/airflow/banking_dbt
       - ./banking_dbt/.dbt:/home/airflow/.dbt
+
     command: scheduler
 
 
