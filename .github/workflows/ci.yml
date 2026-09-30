@@ -6,64 +6,58 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
+# No secrets and no services: lint, unit tests and dbt parse all run offline,
+# so the workflow also passes for pull requests from forks.
 jobs:
   tests:
     runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-          POSTGRES_DB: banking
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            consumer/requirements.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install dbt-snowflake
+          pip install -r requirements-dev.txt dbt-snowflake==1.10.2
 
-      - name: Run linters
-        run: |
-          pip install ruff
-          ruff check .
+      - name: Lint (ruff)
+        run: ruff check .
 
-      - name: Setup dbt profile
+      - name: Unit tests (pytest + coverage)
+        run: pytest
+
+      # dbt parse builds the manifest (refs, sources, tests, Jinja) without
+      # opening a connection, so a placeholder profile is enough.
+      - name: dbt parse (offline)
         run: |
-          mkdir -p ~/.dbt
-          cat > ~/.dbt/profiles.yml <<EOL
+          mkdir -p "$RUNNER_TEMP/dbt"
+          cat > "$RUNNER_TEMP/dbt/profiles.yml" <<'EOL'
           banking_dbt:
-            target: dev
+            target: ci
             outputs:
-              dev:
+              ci:
                 type: snowflake
-                account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-                user: ${{ secrets.SNOWFLAKE_USER }}
-                password: ${{ secrets.SNOWFLAKE_PASSWORD }}
-                role: ACCOUNTADMIN
+                account: ci-offline
+                user: ci-offline
+                private_key_path: /nonexistent/ci.p8
+                role: CI_OFFLINE
                 database: BANKING
-                warehouse: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+                warehouse: CI_OFFLINE
                 schema: ANALYTICS
+                threads: 1
           EOL
-
-      - name: dbt compile (validation)
-        run: |
           cd banking_dbt
-          dbt deps
-          dbt compile
+          dbt parse --profiles-dir "$RUNNER_TEMP/dbt" --no-partial-parse
+          echo "dbt data tests: $(dbt ls --resource-type test --profiles-dir "$RUNNER_TEMP/dbt" --output name -q | wc -l)"
