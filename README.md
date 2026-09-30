@@ -22,7 +22,7 @@ flowchart LR
     GEN[Python generator<br/>Faker] --> PG[(Postgres<br/>OLTP)]
     PG -- WAL / pgoutput --> DBZ[Debezium<br/>Kafka Connect]
     DBZ --> K[(Kafka topics)]
-    K --> C[Python consumer<br/>batch + commit-after-write]
+    K --> C[Python consumer, Docker<br/>batch + commit-after-write]
     C --> M[(MinIO<br/>Parquet, date-partitioned)]
     M -- Airflow: every 1 min<br/>PUT + COPY INTO --> RAW[(Snowflake RAW<br/>CDC event log)]
     RAW -- Airflow Dataset<br/>triggers dbt build --> STG[STAGING<br/>current state]
@@ -50,7 +50,8 @@ flowchart LR
 | `FCT_CDC_EVENTS`, `MON_PIPELINE_FRESHNESS` | Pipeline monitoring: events by operation, ingest latency, freshness |
 
 `RAW` keeps the append-only event log (one row per Debezium event plus `_FILE_NAME`, `_LOADED_AT`).
-`STAGING` derives the current state of each record from it. dbt runs 49 tests on every build.
+`STAGING` derives the current state of each record from it. dbt runs 49 data tests on every build
+(46 generic tests in the `schema.yml` files + 3 singular tests in `banking_dbt/tests/`).
 
 ## Design decisions
 
@@ -64,6 +65,17 @@ flowchart LR
   files are pushed to a table stage. Snowflake's load history makes re-running a load safe.
 - **Watermark on MinIO `LastModified`.** The load DAG only downloads new files, and skips without connecting
   to Snowflake when nothing is new, so the warehouse can suspend.
+- **A failed file fails the load.** `COPY` uses `ON_ERROR = 'SKIP_FILE'` so one bad file doesn't block the
+  others, but every result row is checked by column name: any status other than `LOADED` / `LOAD_SKIPPED`
+  (or a `PUT` that isn't `UPLOADED` / `SKIPPED`) fails the task *before* the watermark moves. Airflow
+  retries, and later runs rediscover the file, so nothing is silently dropped.
+- **Key-pair auth with a least-privilege role.** Airflow and dbt log in as a `TYPE = SERVICE` user with a
+  private key and `BANKING_PIPELINE_ROLE` (usage on one warehouse and database, create/insert in `RAW`,
+  create views/tables in `STAGING` / `ANALYTICS`). CD uses its own `BANKING_CI_USER` / `BANKING_CI_ROLE`.
+  No passwords and no `ACCOUNTADMIN` at runtime ([`snowflake/security_setup.sql`](snowflake/security_setup.sql)).
+- **Consumer in Docker, testable by design.** The consumer runs as a compose service and handles `SIGTERM`
+  (flush, then commit) so `docker stop` loses nothing. Kafka and S3 clients are injected, so the flush /
+  commit / rewind logic is unit-tested with fakes; CI runs ruff, pytest and an offline `dbt parse`.
 - **Balance is not an SCD2 attribute.** It changes on every transaction, so versioning it would create a new
   dimension row per transaction. Balance history lives in `FCT_ACCOUNT_BALANCE_CHANGES`; SCD2 tracks
   descriptive attributes (email, account type).
@@ -86,28 +98,45 @@ flowchart LR
 ## Known limitations
 
 - Single Kafka broker with ZooKeeper, and no schema registry (JSON without schemas).
-- The consumer runs on the host, not in Docker.
-- CI/CD uses a high-privilege Snowflake role; a dedicated deploy role would be better.
+- A file that fails `COPY` every time (e.g. a corrupt Parquet file) keeps the load task failing and the
+  watermark from advancing until it is fixed or removed from MinIO; it is never skipped automatically.
+- The CI role inherits the pipeline role, so CD has the same Snowflake privileges as Airflow (a separate
+  identity, not a narrower one).
+- Python tests are unit tests with fakes; no end-to-end test of the Docker stack runs in CI.
 - Power BI uses Import mode, so the report is as fresh as its last refresh.
+
+## Failure behaviour
+
+| Failure | What happens | Recovery |
+| --- | --- | --- |
+| A file fails `COPY` | Other files in the same `COPY` still load. `load_snowflake` fails, naming the file and Snowflake's `first_error`; the watermark is not advanced | Airflow retries once after 1 min; later runs rediscover the file. Load history skips files already loaded, so nothing is duplicated |
+| MinIO is down while the consumer uploads | The upload raises; Kafka offsets are **not** committed; the consumer seeks back to the batch's first offsets and retries after 5 s | Resumes by itself when MinIO is back. At-least-once: duplicates are removed in staging |
+| Snowflake login fails (missing or wrong key, missing grant) | `load_snowflake` fails before any `PUT`; a missing key file fails with the expected path in the message. The watermark is not advanced | Fix the key or grant; the next run loads everything since the last watermark |
+| A dbt test fails | `dbt build` marks it as an error and skips everything downstream, so the marts keep their last good version. Relationship tests are `warn` (late-arriving rows) | Fix the data or model; the next load re-triggers `dbt build` |
 
 ## Repository layout
 
 ```text
-.github/workflows/   ci.yml (ruff + dbt compile), cd.yml (dbt build on main)
+.github/workflows/   ci.yml (ruff + pytest + offline dbt parse, no secrets), cd.yml (dbt build on main, key-pair auth)
 banking_dbt/         dbt project: staging, snapshots, marts, monitoring, tests, macros
-consumer/            kafka_to_minio.py: Kafka → MinIO Parquet writer
+consumer/            kafka_to_minio.py: Kafka → MinIO Parquet writer; Dockerfile, pinned requirements.txt
 data-generator/      faker_generator.py: balance-aware banking simulator (live + backfill)
 docker/dags/         minio_to_snowflake_dag.py, dbt_banking_build.py
-docs/                RUNBOOK.md (run & test), POWERBI.md (report build)
+docs/                RUNBOOK.md (run & test)
 kafka-debezium/      register_connector.py: creates/updates the Debezium connector
 postgres/            schema.sql: source DDL (constraints, indexes, CDC settings)
 powerbi/             measures.dax
-snowflake/           setup, cleanup and verification SQL
-docker-compose.yml   Postgres, Kafka, Debezium, MinIO, Airflow
+snowflake/           security_setup.sql (role, service users), Power BI setup, cleanup and verification SQL
+tests/               pytest unit tests for the consumer and the load DAG (no Docker or Snowflake needed)
+keys/                Snowflake private keys from `make snowflake-keys` (git-ignored)
+Makefile             snowflake-keys: generate the key pair and print the ALTER USER statement
+docker-compose.yml   Postgres, Kafka, Debezium, MinIO, consumer, Airflow
+**/.env.example      placeholders for every .env file
 ```
+
+Tests: `pip install -r requirements-dev.txt && pytest` (coverage for the consumer and the load DAG is printed).
 
 ## Running it
 
-- [docs/RUNBOOK.md](docs/RUNBOOK.md): start the stack, verify each hop, and run hands-on CDC tests (insert,
-  update, SCD2, delete, storage outage, idempotent reload).
-- [docs/POWERBI.md](docs/POWERBI.md): build the report in the Power BI web editor.
+- [docs/RUNBOOK.md](docs/RUNBOOK.md): Snowflake key-pair setup, start the stack, verify each hop, and run
+  hands-on CDC tests (insert, update, SCD2, delete, storage outage, idempotent reload).
