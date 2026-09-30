@@ -16,12 +16,39 @@ dbt project that turns the raw CDC event log in `BANKING.RAW` into a tested dime
 profile's default schema. `macros/ensure_raw_tables.sql` (an `on-run-start` hook) creates the RAW tables and
 their audit columns if they are missing.
 
+## Profile (key-pair auth)
+
+dbt logs in as `BANKING_PIPELINE_USER` with a private key and the least-privilege role
+`BANKING_PIPELINE_ROLE` (created by [`snowflake/security_setup.sql`](../snowflake/security_setup.sql)).
+No password and no `authenticator` setting are needed. `banking_dbt/.dbt/profiles.yml` is git-ignored
+and is mounted into Airflow as `/home/airflow/.dbt`; it should look like this (values come from
+`docker/dags/.env`):
+
+```yaml
+banking_dbt:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE') }}"                       # BANKING_PIPELINE_ROLE
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      private_key_passphrase: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE', '') }}"  # empty for an unencrypted key
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      database: "{{ env_var('SNOWFLAKE_DB') }}"
+      schema: "{{ env_var('SNOWFLAKE_SCHEMA') }}"
+      threads: 4
+```
+
 ## Running
 
 In production this runs from Airflow (`dbt_banking_build` DAG) after each load. Locally:
 
 ```bash
 set -a; source ../docker/dags/.env; set +a      # SNOWFLAKE_* variables
+# The .env path points inside the Airflow container; use the host copy of the key instead:
+export SNOWFLAKE_PRIVATE_KEY_PATH="$PWD/../keys/snowflake_rsa_key.p8"
 dbt build --profiles-dir .dbt                   # models + snapshots + tests
 dbt source freshness --profiles-dir .dbt
 ```

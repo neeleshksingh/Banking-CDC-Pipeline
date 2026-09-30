@@ -1,5 +1,7 @@
 import json
+import logging
 import os
+import signal
 import tempfile
 import time
 import uuid
@@ -11,27 +13,13 @@ import pandas as pd
 from dotenv import load_dotenv
 from kafka import KafkaConsumer, OffsetAndMetadata, TopicPartition
 
+log = logging.getLogger("kafka_to_minio")
+
 # ============================================================
-# Load consumer/.env
+# Configuration (read in main(); nothing connects at import time)
 # ============================================================
 
 ENV_FILE = Path(__file__).resolve().parent / ".env"
-load_dotenv(ENV_FILE)
-
-print(f"✅ Loaded environment: {ENV_FILE}")
-
-
-# ============================================================
-# Configuration
-# ============================================================
-
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP")
-KAFKA_GROUP = os.getenv("KAFKA_GROUP")
-
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
-MINIO_BUCKET = os.getenv("MINIO_BUCKET")
 
 TOPICS = [
     "banking_server.public.customers",
@@ -40,13 +28,13 @@ TOPICS = [
 ]
 
 # A file is written per table when either limit is reached.
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
-FLUSH_SECONDS = float(os.getenv("FLUSH_SECONDS", "10"))
+DEFAULT_BATCH_SIZE = 500
+DEFAULT_FLUSH_SECONDS = 10.0
 RETRY_BACKOFF_SECONDS = 5
 
 
 # ============================================================
-# Kafka Consumer
+# Kafka helpers
 # ============================================================
 
 def deserialize(raw):
@@ -54,49 +42,11 @@ def deserialize(raw):
     return json.loads(raw.decode("utf-8")) if raw else None
 
 
-consumer = KafkaConsumer(
-    *TOPICS,
-
-    bootstrap_servers=KAFKA_BOOTSTRAP,
-
-    auto_offset_reset="earliest",
-
-    # IMPORTANT:
-    # Kafka offsets are committed manually AFTER MinIO succeeds.
-    enable_auto_commit=False,
-
-    group_id=KAFKA_GROUP,
-
-    value_deserializer=deserialize,
-)
-
-
 def offset_meta(offset):
     # kafka-python >= 2.1 added a leader_epoch field to OffsetAndMetadata.
     if len(OffsetAndMetadata._fields) == 3:
         return OffsetAndMetadata(offset, None, -1)
     return OffsetAndMetadata(offset, None)
-
-
-# ============================================================
-# MinIO Client
-# ============================================================
-
-s3 = boto3.client(
-    "s3",
-    endpoint_url=MINIO_ENDPOINT,
-    aws_access_key_id=MINIO_ACCESS_KEY,
-    aws_secret_access_key=MINIO_SECRET_KEY,
-)
-
-bucket_names = [
-    bucket["Name"]
-    for bucket in s3.list_buckets()["Buckets"]
-]
-
-if MINIO_BUCKET not in bucket_names:
-    s3.create_bucket(Bucket=MINIO_BUCKET)
-    print(f"✅ Created bucket: {MINIO_BUCKET}")
 
 
 # ============================================================
@@ -116,11 +66,11 @@ def to_record(message, event):
     elif operation == "d":
         row = event.get("before")
     else:
-        print(f"⚠️ Unknown Debezium operation: {operation}")
+        log.warning("Unknown Debezium operation: %s | %s | offset=%s", operation, message.topic, message.offset)
         return None
 
     if not row:
-        print(f"⚠️ {str(operation).upper()} event has no row image | {message.topic} | offset={message.offset}")
+        log.warning("%s event has no row image | %s | offset=%s", str(operation).upper(), message.topic, message.offset)
         return None
 
     source = event.get("source") or {}
@@ -151,7 +101,7 @@ def event_date(record):
 # Write records to MinIO
 # ============================================================
 
-def write_to_minio(table_name, records):
+def write_to_minio(s3, bucket, table_name, records):
 
     if not records:
         return
@@ -191,15 +141,11 @@ def write_to_minio(table_name, records):
 
             s3.upload_file(
                 temp_file,
-                MINIO_BUCKET,
+                bucket,
                 s3_key
             )
 
-            print(
-                f"✅ MinIO upload successful | "
-                f"{len(rows)} record(s) | "
-                f"s3://{MINIO_BUCKET}/{s3_key}"
-            )
+            log.info("MinIO upload successful | %d record(s) | s3://%s/%s", len(rows), bucket, s3_key)
 
         finally:
 
@@ -211,127 +157,199 @@ def write_to_minio(table_name, records):
 # Buffering + commit-after-write
 # ============================================================
 
-# table -> {"records": [...], "first_offsets": {tp: offset}, "last_offsets": {tp: offset}, "since": t}
-buffers = {}
+class MinioLander:
+    """Buffers CDC events per table and lands them in MinIO.
 
+    The Kafka consumer and S3 client are passed in, so tests can use fakes.
+    """
 
-def buffer_for(table_name):
-    if table_name not in buffers:
-        buffers[table_name] = {"records": [], "first_offsets": {}, "last_offsets": {}, "since": None}
-    return buffers[table_name]
+    def __init__(self, consumer, s3, bucket, batch_size=DEFAULT_BATCH_SIZE,
+                 flush_seconds=DEFAULT_FLUSH_SECONDS, retry_backoff=RETRY_BACKOFF_SECONDS,
+                 sleep=time.sleep, clock=time.monotonic):
+        self.consumer = consumer
+        self.s3 = s3
+        self.bucket = bucket
+        self.batch_size = batch_size
+        self.flush_seconds = flush_seconds
+        self.retry_backoff = retry_backoff
+        self.sleep = sleep
+        self.clock = clock
+        # table -> {"records": [...], "first_offsets": {tp: offset}, "last_offsets": {tp: offset}, "since": t}
+        self.buffers = {}
+        self.stopping = False
 
+    def buffer_for(self, table_name):
+        if table_name not in self.buffers:
+            self.buffers[table_name] = {"records": [], "first_offsets": {}, "last_offsets": {}, "since": None}
+        return self.buffers[table_name]
 
-def flush(table_name):
-    buf = buffers.get(table_name)
-    if not buf or not buf["last_offsets"]:
-        return
+    def add(self, message):
+        table_name = message.topic.split(".")[-1]
+        buf = self.buffer_for(table_name)
+        tp_key = TopicPartition(message.topic, message.partition)
 
-    try:
+        # Track offsets even for skipped events so they get committed too.
+        buf["first_offsets"].setdefault(tp_key, message.offset)
+        buf["last_offsets"][tp_key] = message.offset
+        if buf["since"] is None:
+            buf["since"] = self.clock()
 
-        write_to_minio(table_name, buf["records"])
+        if message.value is None:
+            return
 
-        # ----------------------------------------------------
-        # IMPORTANT:
-        # Commit ONLY after MinIO upload succeeds.
-        # ----------------------------------------------------
-        consumer.commit({
-            tp: offset_meta(offset + 1)
-            for tp, offset in buf["last_offsets"].items()
-        })
+        record = to_record(message, message.value)
+        if record is None:
+            return
 
-        for tp, offset in buf["last_offsets"].items():
-            print(
-                f"✅ Kafka offset committed | "
-                f"{tp.topic} | "
-                f"partition={tp.partition} | "
-                f"offset={offset + 1}"
+        buf["records"].append(record)
+        log.debug("%s | %s | ID=%s", record["_cdc_operation"].upper(), message.topic, record.get("id"))
+
+    def flush(self, table_name):
+        buf = self.buffers.get(table_name)
+        if not buf or not buf["last_offsets"]:
+            return
+
+        try:
+
+            write_to_minio(self.s3, self.bucket, table_name, buf["records"])
+
+            # ----------------------------------------------------
+            # IMPORTANT:
+            # Commit ONLY after MinIO upload succeeds.
+            # ----------------------------------------------------
+            self.consumer.commit({
+                tp: offset_meta(offset + 1)
+                for tp, offset in buf["last_offsets"].items()
+            })
+
+            for tp, offset in buf["last_offsets"].items():
+                log.info("Kafka offset committed | %s | partition=%s | offset=%d", tp.topic, tp.partition, offset + 1)
+
+        except Exception:
+
+            log.exception("Flush failed for %s", table_name)  # ERROR level, with traceback
+
+            # Rewind so the same events are re-read; nothing is skipped.
+            for tp, offset in buf["first_offsets"].items():
+                self.consumer.seek(tp, offset)
+
+            log.warning(
+                "Kafka offset NOT committed. Rewound %s and retrying in %ss.", table_name, self.retry_backoff
             )
+            self.sleep(self.retry_backoff)
 
-    except Exception as e:  # noqa: BLE001
+        finally:
 
-        print(f"❌ Flush failed for {table_name}: {e}")
+            self.buffers.pop(table_name, None)
 
-        # Rewind so the same events are re-read; nothing is skipped.
-        for tp, offset in buf["first_offsets"].items():
-            consumer.seek(tp, offset)
+    def flush_due(self):
+        now = self.clock()
+        for table_name in list(self.buffers):
+            buf = self.buffers[table_name]
+            if len(buf["records"]) >= self.batch_size or (
+                buf["since"] is not None and now - buf["since"] >= self.flush_seconds
+            ):
+                self.flush(table_name)
 
-        print(
-            "⚠️ Kafka offset NOT committed. "
-            f"Rewound {table_name} and retrying in {RETRY_BACKOFF_SECONDS}s."
-        )
-        time.sleep(RETRY_BACKOFF_SECONDS)
+    def flush_all(self):
+        for table_name in list(self.buffers):
+            self.flush(table_name)
 
-    finally:
-
-        buffers.pop(table_name, None)
-
-
-def flush_due():
-    now = time.monotonic()
-    for table_name in list(buffers):
-        buf = buffers[table_name]
-        if len(buf["records"]) >= BATCH_SIZE or (buf["since"] is not None and now - buf["since"] >= FLUSH_SECONDS):
-            flush(table_name)
-
-
-# ============================================================
-# Start
-# ============================================================
-
-print("============================================")
-print("Kafka → MinIO CDC Consumer")
-print("============================================")
-print(f"Kafka     : {KAFKA_BOOTSTRAP}")
-print(f"Group     : {KAFKA_GROUP}")
-print(f"MinIO     : {MINIO_ENDPOINT}")
-print(f"Bucket    : {MINIO_BUCKET}")
-print(f"Batch     : {BATCH_SIZE} records / {FLUSH_SECONDS}s")
-print("============================================")
-print("✅ Listening for CDC events...")
-
-
-# ============================================================
-# Main loop
-# ============================================================
-
-try:
-    while True:
-
-        polled = consumer.poll(timeout_ms=1000, max_records=BATCH_SIZE)
-
-        for tp, messages in polled.items():
-            table_name = tp.topic.split(".")[-1]
-
+    def poll_once(self):
+        polled = self.consumer.poll(timeout_ms=1000, max_records=self.batch_size)
+        for messages in polled.values():
             for message in messages:
-                buf = buffer_for(table_name)
-                tp_key = TopicPartition(message.topic, message.partition)
+                self.add(message)
+        self.flush_due()
 
-                # Track offsets even for skipped events so they get committed too.
-                buf["first_offsets"].setdefault(tp_key, message.offset)
-                buf["last_offsets"][tp_key] = message.offset
-                if buf["since"] is None:
-                    buf["since"] = time.monotonic()
+    def stop(self, *_):
+        self.stopping = True
 
-                if message.value is None:
-                    continue
+    def run(self):
+        """Poll until stop() is called, then flush whatever is still buffered."""
+        try:
+            while not self.stopping:
+                self.poll_once()
+        except KeyboardInterrupt:
+            log.info("Interrupted by user.")
+        log.info("Shutting down. Flushing buffered events...")
+        self.flush_all()
 
-                record = to_record(message, message.value)
-                if record is None:
-                    continue
 
-                buf["records"].append(record)
-                print(
-                    f"📥 {record['_cdc_operation'].upper()} | "
-                    f"{message.topic} | "
-                    f"ID={record.get('id')}"
-                )
+# ============================================================
+# Wiring
+# ============================================================
 
-        flush_due()
+def make_consumer(bootstrap, group_id):
+    return KafkaConsumer(
+        *TOPICS,
 
-except KeyboardInterrupt:
-    print("\nInterrupted by user. Flushing buffered events...")
-    for table_name in list(buffers):
-        flush(table_name)
+        bootstrap_servers=bootstrap,
 
-finally:
-    consumer.close()
+        auto_offset_reset="earliest",
+
+        # IMPORTANT:
+        # Kafka offsets are committed manually AFTER MinIO succeeds.
+        enable_auto_commit=False,
+
+        group_id=group_id,
+
+        value_deserializer=deserialize,
+    )
+
+
+def make_s3(endpoint, access_key, secret_key):
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+    )
+
+
+def ensure_bucket(s3, bucket):
+    if bucket not in [b["Name"] for b in s3.list_buckets()["Buckets"]]:
+        s3.create_bucket(Bucket=bucket)
+        log.info("Created bucket: %s", bucket)
+
+
+def main():
+    # Variables already set in the environment (e.g. by docker-compose) win over consumer/.env.
+    load_dotenv(ENV_FILE)
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    kafka_bootstrap = os.getenv("KAFKA_BOOTSTRAP")
+    kafka_group = os.getenv("KAFKA_GROUP")
+    minio_endpoint = os.getenv("MINIO_ENDPOINT")
+    bucket = os.getenv("MINIO_BUCKET")
+    batch_size = int(os.getenv("BATCH_SIZE", str(DEFAULT_BATCH_SIZE)))
+    flush_seconds = float(os.getenv("FLUSH_SECONDS", str(DEFAULT_FLUSH_SECONDS)))
+
+    log.info(
+        "Kafka -> MinIO CDC consumer | kafka=%s group=%s minio=%s bucket=%s batch=%d records / %ss",
+        kafka_bootstrap, kafka_group, minio_endpoint, bucket, batch_size, flush_seconds,
+    )
+
+    s3 = make_s3(minio_endpoint, os.getenv("MINIO_ACCESS_KEY"), os.getenv("MINIO_SECRET_KEY"))
+    ensure_bucket(s3, bucket)
+
+    consumer = make_consumer(kafka_bootstrap, kafka_group)
+    lander = MinioLander(consumer, s3, bucket, batch_size=batch_size, flush_seconds=flush_seconds)
+
+    # `docker stop` sends SIGTERM; Ctrl+C sends SIGINT. Both stop the loop
+    # after the current poll, then buffered events are flushed and committed.
+    signal.signal(signal.SIGTERM, lander.stop)
+    signal.signal(signal.SIGINT, lander.stop)
+
+    log.info("Listening for CDC events...")
+    try:
+        lander.run()
+    finally:
+        consumer.close()
+
+
+if __name__ == "__main__":
+    main()

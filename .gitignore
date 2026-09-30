@@ -15,6 +15,11 @@ banking_dbt/dbt_packages/
 
 .env
 .venv
+
+# Snowflake key-pair auth (make snowflake-keys)
+keys/
+*.p8
+*.pem
 __pycache__/
 *.pyc
 .vscode/
@@ -26,3 +31,6 @@ docs/
 
 
 minio.license
+# Test artifacts
+.coverage
+.pytest_cache/

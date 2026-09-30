@@ -1,0 +1,6 @@
+# Unit tests + lint (no Docker, Kafka, MinIO or Snowflake needed)
+-r consumer/requirements.txt
+cryptography==46.0.0
+pytest==8.4.2
+pytest-cov==7.1.0
+ruff==0.16.9

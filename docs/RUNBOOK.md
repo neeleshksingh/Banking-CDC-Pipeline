@@ -1,7 +1,7 @@
 # Runbook: run and test the pipeline by hand
 
 ```text
-Postgres ──WAL──▶ Debezium ──▶ Kafka ──▶ consumer (host) ──▶ MinIO (Parquet)
+Postgres ──WAL──▶ Debezium ──▶ Kafka ──▶ consumer (Docker) ──▶ MinIO (Parquet)
                                                                │  every 1 min
                                                                ▼
                          Airflow: minio_to_snowflake_banking ──▶ Snowflake BANKING.RAW
@@ -23,11 +23,61 @@ All commands run from the repository root unless stated otherwise.
 |---|---|
 | Docker Desktop running | `docker info` |
 | Python venv with dependencies | `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` |
-| Env files present | `.env`, `data-generator/.env`, `kafka-debezium/.env`, `consumer/.env`, `docker/dags/.env` |
-| dbt profile | `banking_dbt/.dbt/profiles.yml` (reads `SNOWFLAKE_*` env vars) |
+| Env files present | `.env`, `data-generator/.env`, `kafka-debezium/.env`, `consumer/.env`, `docker/dags/.env` (copy each `.env.example` and fill it in) |
+| Snowflake key pair | `keys/snowflake_rsa_key.p8` attached to `BANKING_PIPELINE_USER` (section 0b) |
+| dbt profile | `banking_dbt/.dbt/profiles.yml`, key-pair version from [`banking_dbt/README.md`](../banking_dbt/README.md) |
 
 Optional consumer settings in `consumer/.env`: `BATCH_SIZE` (default 500) and `FLUSH_SECONDS` (default 10).
 Optional Airflow admin for a fresh setup in `.env`: `AIRFLOW_ADMIN_USER` / `AIRFLOW_ADMIN_PASSWORD` (default `admin`/`admin`).
+
+Unit tests (no Docker or Snowflake needed): `.venv/bin/pip install -r requirements-dev.txt && .venv/bin/pytest`.
+
+### 0b. Snowflake key-pair auth and least-privilege role (once)
+
+Airflow and dbt log in as the service user `BANKING_PIPELINE_USER` with a private key and the role
+`BANKING_PIPELINE_ROLE`. No password, no `ACCOUNTADMIN`.
+
+1. In Snowsight, as `ACCOUNTADMIN`, run [`snowflake/security_setup.sql`](../snowflake/security_setup.sql)
+   ("Run All"). It is idempotent. It creates the roles, the two service users and the grants.
+2. Generate the key pair (unencrypted PKCS#8, written to the git-ignored `keys/`):
+
+   ```bash
+   make snowflake-keys
+   ```
+
+   Run the printed `ALTER USER BANKING_PIPELINE_USER SET RSA_PUBLIC_KEY = '...';` in Snowsight, then check
+   that `describe user BANKING_PIPELINE_USER` shows an `RSA_PUBLIC_KEY_FP`.
+3. **One-time ownership transfer.** Tables and views created so far belong to `ACCOUNTADMIN`. Review and run
+   the commented `grant ownership ... copy current grants` block (section 7) in `security_setup.sql`.
+   Without it, `PUT` into `@%table`, `ALTER TABLE` and dbt's `create or replace` fail with
+   "Insufficient privileges".
+4. In `docker/dags/.env`: set `SNOWFLAKE_USER=BANKING_PIPELINE_USER`, `SNOWFLAKE_ROLE=BANKING_PIPELINE_ROLE`,
+   `SNOWFLAKE_PRIVATE_KEY_PATH=/opt/airflow/keys/snowflake_rsa_key.p8`, an empty
+   `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE=`, and delete `SNOWFLAKE_PASSWORD` (see `docker/dags/.env.example`).
+5. Replace `banking_dbt/.dbt/profiles.yml` with the key-pair profile in
+   [`banking_dbt/README.md`](../banking_dbt/README.md) (`private_key_path`, `role`; no `password`).
+6. Recreate the Airflow containers so they pick up the env file and the `./keys` mount (read-only at
+   `/opt/airflow/keys`): `docker compose up -d --force-recreate airflow-webserver airflow-scheduler`.
+
+Check: `docker exec airflow-scheduler ls -l /opt/airflow/keys` lists the key, and a manual run of
+`minio_to_snowflake_banking` succeeds. On Linux hosts the key file must be readable by the container's
+`airflow` user (uid 50000); Docker Desktop on macOS maps permissions for you.
+
+**GitHub Actions (CD).** Create a second key for the CI user and add repository secrets:
+
+```bash
+make snowflake-keys KEY_NAME=snowflake_ci_key SF_USER=BANKING_CI_USER   # run the printed ALTER USER
+```
+
+| Secret | Value |
+|---|---|
+| `SNOWFLAKE_ACCOUNT` | account identifier |
+| `SNOWFLAKE_CI_USER` | `BANKING_CI_USER` |
+| `SNOWFLAKE_WAREHOUSE` | `COMPUTE_WH` |
+| `SNOWFLAKE_PRIVATE_KEY` | full contents of `keys/snowflake_ci_key.p8`, including the `BEGIN` / `END` lines |
+
+`SNOWFLAKE_PASSWORD` and `SNOWFLAKE_USER` are no longer used by the workflows and can be deleted. CI needs no
+secrets at all.
 
 ---
 
@@ -38,7 +88,8 @@ docker compose up -d --build
 docker compose ps -a
 ```
 
-Wait until `postgres`, `kafka` and `connect` show **healthy**, and `airflow-init` shows **exited (0)**.
+Wait until `postgres`, `kafka`, `connect` and `minio` show **healthy**, `consumer` is **running**, and
+`airflow-init` shows **exited (0)**.
 Kafka may restart once or twice with `NodeExists` right after a restart; the restart policy recovers it
 within ~30 s.
 
@@ -89,14 +140,29 @@ docker exec kafka kafka-topics --bootstrap-server localhost:9092 --list | grep b
 
 ---
 
-## 4. Start the Kafka → MinIO consumer (terminal 1)
+## 4. The Kafka → MinIO consumer
+
+**In Docker (default).** `docker compose up -d --build` starts the `consumer` service once Kafka and MinIO
+are healthy. It uses the in-network endpoints (`kafka:9092`, `http://minio:9000`) and takes credentials,
+`KAFKA_GROUP`, `BATCH_SIZE` and `FLUSH_SECONDS` from `consumer/.env`.
 
 ```bash
-.venv/bin/python consumer/kafka_to_minio.py
+docker compose logs -f consumer
 ```
 
-Leave it running. Expect `📥 C | ...` lines followed by `✅ MinIO upload successful` and
-`✅ Kafka offset committed` every ~10 s while events flow.
+Expect `MinIO upload successful` and `Kafka offset committed` lines every ~10 s while events flow.
+Per-event lines are logged at DEBUG: set `CONSUMER_LOG_LEVEL=DEBUG` in `.env` and recreate the service
+to see them. `docker compose stop consumer` sends SIGTERM: the consumer flushes and commits what it has
+buffered before exiting.
+
+**On the host (terminal 1).** Stop the container first, so the two don't share the consumer group:
+
+```bash
+docker compose stop consumer
+LOG_LEVEL=INFO .venv/bin/python consumer/kafka_to_minio.py
+```
+
+It reads `consumer/.env` (`localhost:29092`, `http://localhost:9000`). `Ctrl+C` flushes and exits.
 
 > The previous consumer never committed offsets (a kafka-python API mismatch), so on its first start this
 > version re-reads everything still retained in Kafka (7 days). That's expected: duplicates are removed in
@@ -165,7 +231,7 @@ transaction, marks overdrawing debits as `FAILED`, and sometimes changes a custo
 
 | Hop | Where to look | What you should see |
 |---|---|---|
-| Kafka → MinIO | terminal 1 | uploads + committed offsets |
+| Kafka → MinIO | `docker compose logs -f consumer` (or terminal 1) | uploads + committed offsets |
 | MinIO | http://localhost:9001 → bucket `raw` | `customers/ accounts/ transactions/` → `date=YYYY-MM-DD/*.parquet` |
 | MinIO → Snowflake | Airflow → `minio_to_snowflake_banking` → `load_snowflake` log | `COPY ...: LOADED` rows |
 | dbt | Airflow → `dbt_banking_build` → `dbt_build` log | `Completed successfully` |
@@ -209,7 +275,8 @@ Run each test, wait ~3–4 minutes, then check Snowflake.
 ### Failure test: nothing is lost when MinIO is down
 
 1. Run the generator continuously (step 7).
-2. `docker stop minio` → terminal 1 shows `❌ Flush failed ... Rewound ... retrying`.
+2. `docker stop minio` → `docker compose logs -f consumer` shows `ERROR ... Flush failed` with a traceback,
+   then `Kafka offset NOT committed. Rewound ... retrying`.
 3. `docker start minio` → uploads resume from the rewound offsets.
 4. Stop the generator, wait ~4 min, and compare counts (step 9): they match.
 
@@ -238,7 +305,8 @@ Keep using the new name (`CONNECTOR_NAME=banking-cdc-connector-v2`) for later ru
 
 ## 12. Stop
 
-1. `Ctrl+C` the generator, then the consumer (it flushes buffered events before exiting).
+1. `Ctrl+C` the generator. The consumer container flushes and commits on `docker compose stop` (SIGTERM);
+   a host-run consumer does the same on `Ctrl+C`.
 2. `docker compose stop` keeps containers, Kafka topics and connector offsets.
    Avoid `docker compose down` unless you want a clean Kafka; the next start will then re-snapshot.
 
@@ -253,4 +321,9 @@ Keep using the new name (`CONNECTOR_NAME=banking-cdc-connector-v2`) for later ru
 | `fact_transactions was built by an older version of this model` | Run step 5 (cleanup + `--full-refresh`) |
 | `load_snowflake` fails with `SignatureDoesNotMatch` | MinIO keys in `docker/dags/.env` don't match the MinIO root user |
 | `Could not connect to Snowflake backend` | Network/DNS from Docker; the task retries once. Re-trigger the DAG |
+| `Snowflake private key not found at ...` | `keys/` is missing or not mounted: run `make snowflake-keys`, then recreate the Airflow containers (step 0b) |
+| `JWT token is invalid` / `Failed to authenticate` | The public key on the user doesn't match the private key: re-run the printed `ALTER USER ... SET RSA_PUBLIC_KEY` |
+| `Insufficient privileges` / `does not exist or not authorized` | Existing objects are still owned by `ACCOUNTADMIN`: run the ownership transfer (step 0b.3) |
+| `load_snowflake` fails with `COPY failed for N file(s)` | The log names each file and Snowflake's `first_error`. Fix or remove the file in MinIO; the watermark only moves once every file loads |
+| `consumer` never starts | It waits for Kafka and MinIO to be healthy: `docker compose ps` and `docker compose logs minio kafka` |
 | dbt test failure in `dbt_build` | Open the task log. Downstream models are skipped, so bad data never reaches the marts |
