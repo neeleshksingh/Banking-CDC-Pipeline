@@ -135,7 +135,36 @@ services:
       - "9001:9001"
     volumes:
       - ./docker/minio/data:/data
-    
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # Kafka -> MinIO Parquet writer. Commits offsets only after an upload
+  # succeeds; `docker stop` (SIGTERM) flushes buffered events first.
+  consumer:
+    build:
+      context: ./consumer
+    image: banking-consumer:latest
+    container_name: kafka-consumer
+    restart: unless-stopped
+    # MinIO credentials, KAFKA_GROUP, BATCH_SIZE, ... from consumer/.env;
+    # the endpoints below replace its host-side (localhost) values.
+    env_file:
+      - ./consumer/.env
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      MINIO_ENDPOINT: http://minio:9000
+      LOG_LEVEL: ${CONSUMER_LOG_LEVEL:-INFO}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    # Room for the final flush (a failed upload waits 5 s before giving up)
+    stop_grace_period: 30s
+
   # ---------------- Airflow (shared config) ----------------
   airflow-init:
     <<: *airflow-common

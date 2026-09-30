@@ -89,14 +89,29 @@ docker exec kafka kafka-topics --bootstrap-server localhost:9092 --list | grep b
 
 ---
 
-## 4. Start the Kafka → MinIO consumer (terminal 1)
+## 4. The Kafka → MinIO consumer
+
+**In Docker (default).** `docker compose up -d --build` starts the `consumer` service once Kafka and MinIO
+are healthy. It uses the in-network endpoints (`kafka:9092`, `http://minio:9000`) and takes credentials,
+`KAFKA_GROUP`, `BATCH_SIZE` and `FLUSH_SECONDS` from `consumer/.env`.
 
 ```bash
-.venv/bin/python consumer/kafka_to_minio.py
+docker compose logs -f consumer
 ```
 
-Leave it running. Expect `📥 C | ...` lines followed by `✅ MinIO upload successful` and
-`✅ Kafka offset committed` every ~10 s while events flow.
+Expect `MinIO upload successful` and `Kafka offset committed` lines every ~10 s while events flow.
+Per-event lines are logged at DEBUG: set `CONSUMER_LOG_LEVEL=DEBUG` in `.env` and recreate the service
+to see them. `docker compose stop consumer` sends SIGTERM: the consumer flushes and commits what it has
+buffered before exiting.
+
+**On the host (terminal 1).** Stop the container first, so the two don't share the consumer group:
+
+```bash
+docker compose stop consumer
+LOG_LEVEL=INFO .venv/bin/python consumer/kafka_to_minio.py
+```
+
+It reads `consumer/.env` (`localhost:29092`, `http://localhost:9000`). `Ctrl+C` flushes and exits.
 
 > The previous consumer never committed offsets (a kafka-python API mismatch), so on its first start this
 > version re-reads everything still retained in Kafka (7 days). That's expected: duplicates are removed in
