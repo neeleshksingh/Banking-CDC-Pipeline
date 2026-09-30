@@ -31,3 +31,6 @@ docs/
 
 
 minio.license
+# Test artifacts
+.coverage
+.pytest_cache/
