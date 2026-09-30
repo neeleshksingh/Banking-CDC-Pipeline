@@ -2,8 +2,17 @@ version: 2
 
 sources:
   - name: raw
+    description: >
+      Append-only CDC event log loaded by Airflow from MinIO Parquet.
+      Each row is one Debezium event: the row image in `v` plus CDC metadata
+      (_cdc_operation, _source_lsn, _kafka_offset, ...) added by the consumer.
     database: BANKING
     schema: RAW
+    config:
+      loaded_at_field: _loaded_at
+      freshness:
+        warn_after: {count: 30, period: minute}
+        error_after: {count: 24, period: hour}
     tables:
       - name: customers
       - name: accounts

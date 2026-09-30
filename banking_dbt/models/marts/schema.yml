@@ -1,0 +1,112 @@
+version: 2
+
+models:
+  - name: dim_customers
+    description: One row per current customer (Type 1). History in dim_customers_history.
+    columns:
+      - name: customer_id
+        data_tests: [unique, not_null]
+      - name: customer_name
+        data_tests: [not_null]
+      - name: account_mix
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['MIXED', 'SAVINGS_ONLY', 'CHECKING_ONLY', 'NO_ACCOUNTS']
+
+  - name: dim_accounts
+    description: One row per current account with latest balance (Type 1).
+    columns:
+      - name: account_id
+        data_tests: [unique, not_null]
+      - name: customer_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_customers')
+                field: customer_id
+              config:
+                severity: warn    # accounts can land a few seconds before their customer
+      - name: account_type
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['SAVINGS', 'CHECKING']
+      - name: currency
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['USD']
+      - name: balance
+        data_tests: [not_null]
+
+  - name: dim_customers_history
+    description: SCD2 customer versions from customers_snapshot.
+    columns:
+      - name: customer_version_key
+        data_tests: [unique, not_null]
+
+  - name: dim_accounts_history
+    description: SCD2 account versions from accounts_snapshot.
+    columns:
+      - name: account_version_key
+        data_tests: [unique, not_null]
+
+  - name: dim_date
+    description: Calendar dimension (contiguous days, full years). Mark as date table in Power BI.
+    columns:
+      - name: date
+        data_tests: [unique, not_null]
+
+  - name: fact_transactions
+    description: One row per banking transaction. TRANSFER = one row (account_id sends, related_account_id receives).
+    columns:
+      - name: transaction_id
+        data_tests: [unique, not_null]
+      - name: account_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_accounts')
+                field: account_id
+              config:
+                severity: warn    # late-arriving account events resolve on the next build
+      - name: related_account_id
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('dim_accounts')
+                field: account_id
+              config:
+                severity: warn
+      - name: transaction_type
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['DEPOSIT', 'WITHDRAWAL', 'TRANSFER']
+      - name: status
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['COMPLETED', 'FAILED']
+      - name: amount
+        data_tests: [not_null]
+      - name: transaction_date
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_date')
+                field: date
+
+  - name: fct_account_balance_changes
+    description: One row per observed account balance version, from the CDC event log.
+    columns:
+      - name: account_id
+        data_tests: [not_null]
+      - name: balance
+        data_tests: [not_null]

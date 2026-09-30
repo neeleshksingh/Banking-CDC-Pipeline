@@ -1,7 +1,9 @@
 import json
 import os
 import tempfile
-from datetime import datetime
+import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import boto3
@@ -37,14 +39,20 @@ TOPICS = [
     "banking_server.public.transactions",
 ]
 
-# Keep this at 1 for our first end-to-end test.
-# Later change to 50.
-BATCH_SIZE = 1
+# A file is written per table when either limit is reached.
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
+FLUSH_SECONDS = float(os.getenv("FLUSH_SECONDS", "10"))
+RETRY_BACKOFF_SECONDS = 5
 
 
 # ============================================================
 # Kafka Consumer
 # ============================================================
+
+def deserialize(raw):
+    # Tombstones (value=None) are disabled in the connector, but be defensive.
+    return json.loads(raw.decode("utf-8")) if raw else None
+
 
 consumer = KafkaConsumer(
     *TOPICS,
@@ -59,10 +67,15 @@ consumer = KafkaConsumer(
 
     group_id=KAFKA_GROUP,
 
-    value_deserializer=lambda x: json.loads(
-        x.decode("utf-8")
-    ),
+    value_deserializer=deserialize,
 )
+
+
+def offset_meta(offset):
+    # kafka-python >= 2.1 added a leader_epoch field to OffsetAndMetadata.
+    if len(OffsetAndMetadata._fields) == 3:
+        return OffsetAndMetadata(offset, None, -1)
+    return OffsetAndMetadata(offset, None)
 
 
 # ============================================================
@@ -87,6 +100,54 @@ if MINIO_BUCKET not in bucket_names:
 
 
 # ============================================================
+# Event -> flat record
+# ============================================================
+
+def to_record(message, event):
+    """Flatten a Debezium envelope into one row with CDC metadata.
+
+    Returns None for events that carry no row image.
+    """
+    event = event.get("payload", event)  # tolerate schemas.enable=true
+    operation = event.get("op")
+
+    if operation in ("c", "r", "u"):
+        row = event.get("after")
+    elif operation == "d":
+        row = event.get("before")
+    else:
+        print(f"⚠️ Unknown Debezium operation: {operation}")
+        return None
+
+    if not row:
+        print(f"⚠️ {str(operation).upper()} event has no row image | {message.topic} | offset={message.offset}")
+        return None
+
+    source = event.get("source") or {}
+
+    # All values are written as strings (NULLs stay NULL): Parquet columns get a
+    # stable type across batches, and dbt casts them to proper types in staging.
+    record = {k: (None if v is None else str(v)) for k, v in row.items()}
+    record.update({
+        "_cdc_operation": operation,
+        "_cdc_ts_ms": str(event.get("ts_ms")) if event.get("ts_ms") is not None else None,
+        "_source_ts_ms": str(source.get("ts_ms")) if source.get("ts_ms") is not None else None,
+        "_source_lsn": str(source.get("lsn")) if source.get("lsn") is not None else None,
+        "_source_tx_id": str(source.get("txId")) if source.get("txId") is not None else None,
+        "_kafka_topic": message.topic,
+        "_kafka_partition": str(message.partition),
+        "_kafka_offset": str(message.offset),
+    })
+    return record
+
+
+def event_date(record):
+    ts_ms = record.get("_source_ts_ms") or record.get("_cdc_ts_ms")
+    ts = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc) if ts_ms else datetime.now(timezone.utc)
+    return ts.strftime("%Y-%m-%d")
+
+
+# ============================================================
 # Write records to MinIO
 # ============================================================
 
@@ -95,50 +156,122 @@ def write_to_minio(table_name, records):
     if not records:
         return
 
-    df = pd.DataFrame(records)
+    # Partition by event date (UTC); a batch may straddle midnight.
+    by_date = {}
+    for record in records:
+        by_date.setdefault(event_date(record), []).append(record)
 
-    date_str = datetime.now().astimezone().strftime("%Y-%m-%d")
-    timestamp = datetime.now().astimezone().strftime("%H%M%S%f")
+    for date_str, rows in by_date.items():
 
-    file_name = f"{table_name}_{timestamp}.parquet"
+        df = pd.DataFrame(rows, dtype=object)
 
-    s3_key = (
-        f"{table_name}/"
-        f"date={date_str}/"
-        f"{file_name}"
-    )
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        file_name = f"{table_name}_{stamp}_{uuid.uuid4().hex[:6]}.parquet"
 
-    with tempfile.NamedTemporaryFile(
-        suffix=".parquet",
-        delete=False
-    ) as tmp:
+        s3_key = (
+            f"{table_name}/"
+            f"date={date_str}/"
+            f"{file_name}"
+        )
 
-        temp_file = tmp.name
+        with tempfile.NamedTemporaryFile(
+            suffix=".parquet",
+            delete=False
+        ) as tmp:
+
+            temp_file = tmp.name
+
+        try:
+
+            df.to_parquet(
+                temp_file,
+                engine="fastparquet",
+                index=False
+            )
+
+            s3.upload_file(
+                temp_file,
+                MINIO_BUCKET,
+                s3_key
+            )
+
+            print(
+                f"✅ MinIO upload successful | "
+                f"{len(rows)} record(s) | "
+                f"s3://{MINIO_BUCKET}/{s3_key}"
+            )
+
+        finally:
+
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+
+# ============================================================
+# Buffering + commit-after-write
+# ============================================================
+
+# table -> {"records": [...], "first_offsets": {tp: offset}, "last_offsets": {tp: offset}, "since": t}
+buffers = {}
+
+
+def buffer_for(table_name):
+    if table_name not in buffers:
+        buffers[table_name] = {"records": [], "first_offsets": {}, "last_offsets": {}, "since": None}
+    return buffers[table_name]
+
+
+def flush(table_name):
+    buf = buffers.get(table_name)
+    if not buf or not buf["last_offsets"]:
+        return
 
     try:
 
-        df.to_parquet(
-            temp_file,
-            engine="fastparquet",
-            index=False
-        )
+        write_to_minio(table_name, buf["records"])
 
-        s3.upload_file(
-            temp_file,
-            MINIO_BUCKET,
-            s3_key
-        )
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # Commit ONLY after MinIO upload succeeds.
+        # ----------------------------------------------------
+        consumer.commit({
+            tp: offset_meta(offset + 1)
+            for tp, offset in buf["last_offsets"].items()
+        })
+
+        for tp, offset in buf["last_offsets"].items():
+            print(
+                f"✅ Kafka offset committed | "
+                f"{tp.topic} | "
+                f"partition={tp.partition} | "
+                f"offset={offset + 1}"
+            )
+
+    except Exception as e:  # noqa: BLE001
+
+        print(f"❌ Flush failed for {table_name}: {e}")
+
+        # Rewind so the same events are re-read; nothing is skipped.
+        for tp, offset in buf["first_offsets"].items():
+            consumer.seek(tp, offset)
 
         print(
-            f"✅ MinIO upload successful | "
-            f"{len(records)} record(s) | "
-            f"s3://{MINIO_BUCKET}/{s3_key}"
+            "⚠️ Kafka offset NOT committed. "
+            f"Rewound {table_name} and retrying in {RETRY_BACKOFF_SECONDS}s."
         )
+        time.sleep(RETRY_BACKOFF_SECONDS)
 
     finally:
 
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
+        buffers.pop(table_name, None)
+
+
+def flush_due():
+    now = time.monotonic()
+    for table_name in list(buffers):
+        buf = buffers[table_name]
+        if len(buf["records"]) >= BATCH_SIZE or (buf["since"] is not None and now - buf["since"] >= FLUSH_SECONDS):
+            flush(table_name)
 
 
 # ============================================================
@@ -152,7 +285,7 @@ print(f"Kafka     : {KAFKA_BOOTSTRAP}")
 print(f"Group     : {KAFKA_GROUP}")
 print(f"MinIO     : {MINIO_ENDPOINT}")
 print(f"Bucket    : {MINIO_BUCKET}")
-print(f"Batch     : {BATCH_SIZE}")
+print(f"Batch     : {BATCH_SIZE} records / {FLUSH_SECONDS}s")
 print("============================================")
 print("✅ Listening for CDC events...")
 
@@ -161,122 +294,44 @@ print("✅ Listening for CDC events...")
 # Main loop
 # ============================================================
 
-for message in consumer:
+try:
+    while True:
 
-    topic = message.topic
-    event = message.value
+        polled = consumer.poll(timeout_ms=1000, max_records=BATCH_SIZE)
 
-    operation = event.get("op")
+        for tp, messages in polled.items():
+            table_name = tp.topic.split(".")[-1]
 
-    before = event.get("before")
-    after = event.get("after")
+            for message in messages:
+                buf = buffer_for(table_name)
+                tp_key = TopicPartition(message.topic, message.partition)
 
+                # Track offsets even for skipped events so they get committed too.
+                buf["first_offsets"].setdefault(tp_key, message.offset)
+                buf["last_offsets"][tp_key] = message.offset
+                if buf["since"] is None:
+                    buf["since"] = time.monotonic()
 
-    # --------------------------------------------------------
-    # CREATE / SNAPSHOT / UPDATE
-    # --------------------------------------------------------
+                if message.value is None:
+                    continue
 
-    if operation in ("c", "r", "u"):
+                record = to_record(message, message.value)
+                if record is None:
+                    continue
 
-        record = after
+                buf["records"].append(record)
+                print(
+                    f"📥 {record['_cdc_operation'].upper()} | "
+                    f"{message.topic} | "
+                    f"ID={record.get('id')}"
+                )
 
-        if not record:
-            print(
-                f"⚠️ {operation.upper()} event has no 'after'"
-            )
-            continue
+        flush_due()
 
-        record["_cdc_operation"] = operation
+except KeyboardInterrupt:
+    print("\nInterrupted by user. Flushing buffered events...")
+    for table_name in list(buffers):
+        flush(table_name)
 
-        print(
-            f"📥 {operation.upper()} | "
-            f"{topic} | "
-            f"ID={record.get('id')}"
-        )
-
-
-    # --------------------------------------------------------
-    # DELETE
-    # --------------------------------------------------------
-
-    elif operation == "d":
-
-        record = before
-
-        if not record:
-            print(
-                "⚠️ DELETE event has no 'before'"
-            )
-            continue
-
-        record["_cdc_operation"] = "d"
-
-        print(
-            f"🗑️ DELETE | "
-            f"{topic} | "
-            f"ID={record.get('id')}"
-        )
-
-
-    # --------------------------------------------------------
-    # Unknown operation
-    # --------------------------------------------------------
-
-    else:
-
-        print(
-            f"⚠️ Unknown Debezium operation: {operation}"
-        )
-
-        continue
-
-
-    # --------------------------------------------------------
-    # Write to MinIO
-    # --------------------------------------------------------
-
-    table_name = topic.split(".")[-1]
-
-    try:
-
-        write_to_minio(
-            table_name,
-            [record]
-        )
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        # Commit ONLY after MinIO upload succeeds.
-        # ----------------------------------------------------
-
-        partition = TopicPartition(
-            message.topic,
-            message.partition
-        )
-
-        offset = OffsetAndMetadata(
-            message.offset + 1,
-            None
-        )
-
-        consumer.commit({
-            partition: offset
-        })
-
-        print(
-            f"✅ Kafka offset committed | "
-            f"{topic} | "
-            f"partition={message.partition} | "
-            f"offset={message.offset + 1}"
-        )
-
-    except Exception as e:  # noqa: BLE001
-
-        print(
-            f"❌ MinIO write failed: {e}"
-        )
-
-        print(
-            "⚠️ Kafka offset NOT committed. "
-            "This message will be retried."
-        )
+finally:
+    consumer.close()

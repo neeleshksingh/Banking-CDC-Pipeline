@@ -7,7 +7,29 @@ analysis-paths: ["analyses"]
 test-paths: ["tests"]
 seed-paths: ["seeds"]
 snapshot-paths: ["snapshots"]
+macro-paths: ["macros"]
 
 clean-targets:
   - "target"
   - "dbt_packages"
+
+# RAW tables are created/extended by the ingestion DAG; this makes sure the
+# audit columns staging relies on (_file_name, _loaded_at) always exist.
+on-run-start:
+  - "{{ ensure_raw_tables() }}"
+
+# Schemas are used exactly as named (see macros/generate_schema_name.sql):
+#   BANKING.RAW        <- landing tables (Airflow COPY)
+#   BANKING.STAGING    <- CDC-applied current state (views)
+#   BANKING.ANALYTICS  <- snapshots, dimensions, facts, monitoring
+models:
+  banking_dbt:
+    staging:
+      +schema: STAGING
+      +materialized: view
+    marts:
+      +schema: ANALYTICS
+      +materialized: table
+    monitoring:
+      +schema: ANALYTICS
+      +materialized: table

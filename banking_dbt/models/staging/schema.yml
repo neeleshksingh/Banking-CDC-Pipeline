@@ -1,0 +1,28 @@
+version: 2
+
+models:
+  - name: stg_customers
+    description: Current state per customer, CDC applied (latest version by LSN, deletes removed).
+    columns:
+      - name: customer_id
+        data_tests: [unique, not_null]
+      - name: email
+        data_tests: [not_null]
+
+  - name: stg_accounts
+    description: Current state per account including latest balance, CDC applied.
+    columns:
+      - name: account_id
+        data_tests: [unique, not_null]
+      - name: customer_id
+        data_tests: [not_null]
+      - name: balance
+        data_tests: [not_null]
+
+  - name: stg_transactions
+    description: Latest version per transaction; is_deleted flags CDC deletes.
+    columns:
+      - name: transaction_id
+        data_tests: [unique, not_null]
+      - name: account_id
+        data_tests: [not_null]

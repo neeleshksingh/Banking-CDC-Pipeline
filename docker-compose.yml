@@ -1,4 +1,27 @@
-version: '3.8'
+x-airflow-common: &airflow-common
+  # Built once by airflow-init (below); webserver/scheduler reuse the same image.
+  # Building it in every service makes parallel builds collide on the tag.
+  image: banking-airflow:2.9.3
+  pull_policy: never
+  restart: always
+  # MinIO + Snowflake settings for the DAGs and dbt (SNOWFLAKE_*, MINIO_*)
+  env_file:
+    - ./docker/dags/.env
+  environment:
+    AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    # LocalExecutor: ingestion and dbt DAGs can run in parallel
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB_NAME}
+  volumes:
+    - ./docker/dags:/opt/airflow/dags
+    - ./docker/logs:/opt/airflow/logs
+    - ./docker/plugins:/opt/airflow/plugins
+    - ./banking_dbt:/opt/airflow/banking_dbt
+    - ./banking_dbt/.dbt:/home/airflow/.dbt
+  depends_on:
+    airflow-postgres:
+      condition: service_healthy
+
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
@@ -11,8 +34,17 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.4.1
     container_name: kafka
+    # A fast restart can hit "NodeExists" in ZooKeeper while the previous
+    # broker session is still registered; retrying resolves it once it expires.
+    restart: unless-stopped
     depends_on:
       - zookeeper
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
     ports:
       - "9092:9092"
       - "29092:29092"
@@ -36,10 +68,18 @@ services:
   connect:
     image: debezium/connect:2.2
     platform: linux/amd64
+    restart: unless-stopped
     depends_on:
-      - kafka
-      - zookeeper
-      - postgres
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8083/connectors > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
     ports:
       - "8083:8083"
     environment:
@@ -66,6 +106,15 @@ services:
 
     volumes:
       - ./docker/postgres/data:/var/lib/postgresql/data
+      # Applied automatically only when the data directory is empty (fresh setup).
+      # On an existing database, apply it manually (see docs/RUNBOOK.md) - it is idempotent.
+      - ./postgres/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
     command: >
       postgres -c wal_level=logical
@@ -85,76 +134,43 @@ services:
     volumes:
       - ./docker/minio/data:/data
     
-  airflow-webserver:
+  # ---------------- Airflow (shared config) ----------------
+  airflow-init:
+    <<: *airflow-common
     build:
       context: .
       dockerfile: dockerfile-airflow.dockerfile
+    pull_policy: missing
+    container_name: airflow-init
+    restart: "no"
+    # Idempotent: migrates the metadata DB and creates the admin user if missing.
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        (airflow users create --username "${AIRFLOW_ADMIN_USER:-admin}" --password "${AIRFLOW_ADMIN_PASSWORD:-admin}" \
+          --firstname Admin --lastname User --role Admin --email admin@example.com || true)
+
+  airflow-webserver:
+    <<: *airflow-common
     container_name: airflow-webserver
-    restart: always
-
-    env_file:
-      - ./docker/dags/.env
-
     depends_on:
-      - airflow-scheduler
-      - airflow-postgres
-
-    environment:
-      - AIRFLOW__CORE__LOAD_EXAMPLES=False
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB_NAME}
-
-      # MinIO
-      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
-      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
-      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
-      - MINIO_BUCKET=${MINIO_BUCKET}
-      - MINIO_LOCAL_DIR=${MINIO_LOCAL_DIR}
-
-    volumes:
-      - ./docker/dags:/opt/airflow/dags
-      - ./docker/logs:/opt/airflow/logs
-      - ./docker/plugins:/opt/airflow/plugins
-      - ./banking_dbt:/opt/airflow/banking_dbt
-      - ./banking_dbt/.dbt:/home/airflow/.dbt
-
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-scheduler:
+        condition: service_started
     ports:
       - "8080:8080"
-
     command: webserver
 
   airflow-scheduler:
-    build:
-      context: .
-      dockerfile: dockerfile-airflow.dockerfile
+    <<: *airflow-common
     container_name: airflow-scheduler
-    restart: always
-
-    env_file:
-      - ./docker/dags/.env
-
     depends_on:
-      - airflow-postgres
-
-    environment:
-      - AIRFLOW__CORE__LOAD_EXAMPLES=False
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB_NAME}
-
-      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
-      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
-      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
-      - MINIO_BUCKET=${MINIO_BUCKET}
-      - MINIO_LOCAL_DIR=${MINIO_LOCAL_DIR}
-
-    volumes:
-      - ./docker/dags:/opt/airflow/dags
-      - ./docker/logs:/opt/airflow/logs
-      - ./docker/plugins:/opt/airflow/plugins
-      - ./banking_dbt:/opt/airflow/banking_dbt
-      - ./banking_dbt/.dbt:/home/airflow/.dbt
-
+      airflow-init:
+        condition: service_completed_successfully
     command: scheduler
-
-
 
   airflow-postgres:
     image: postgres:15
@@ -168,6 +184,11 @@ services:
       - airflow_postgres_data:/var/lib/postgresql/data
     ports:
       - "5433:5432"  # separate from banking-postgres to avoid conflict
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
 volumes:
   airflow_postgres_data:

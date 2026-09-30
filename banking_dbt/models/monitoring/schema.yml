@@ -1,0 +1,17 @@
+version: 2
+
+models:
+  - name: fct_cdc_events
+    description: One row per CDC event landed in Snowflake RAW, with ingestion latency.
+    columns:
+      - name: cdc_operation
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['r', 'c', 'u', 'd', 'legacy']
+
+  - name: mon_pipeline_freshness
+    description: One row per source table with event counts and freshness timestamps.
+    columns:
+      - name: source_table
+        data_tests: [unique, not_null]

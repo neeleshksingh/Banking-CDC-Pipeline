@@ -7,17 +7,15 @@ docker/minio/
 docker/plugins/
 docker/postgres/
 
-# DBT cache
+# DBT cache (macros/, tests/, seeds/, analyses/ are source code: keep them tracked)
 banking_dbt/.dbt/
-banking_dbt/analyses/
 banking_dbt/logs/
-banking_dbt/macros/
-banking_dbt/seeds/
 banking_dbt/target/
-banking_dbt/tests/
+banking_dbt/dbt_packages/
 
 .env
 .venv
+.claude
 __pycache__/
 *.pyc
 .vscode/
