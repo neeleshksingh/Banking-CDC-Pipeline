@@ -1,13 +1,13 @@
-import boto3
-from kafka import KafkaConsumer, TopicPartition, OffsetAndMetadata
 import json
-import pandas as pd
-from datetime import datetime
 import os
 import tempfile
+from datetime import datetime
 from pathlib import Path
-from dotenv import load_dotenv
 
+import boto3
+import pandas as pd
+from dotenv import load_dotenv
+from kafka import KafkaConsumer, OffsetAndMetadata, TopicPartition
 
 # ============================================================
 # Load consumer/.env
@@ -97,8 +97,8 @@ def write_to_minio(table_name, records):
 
     df = pd.DataFrame(records)
 
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    timestamp = datetime.now().strftime("%H%M%S%f")
+    date_str = datetime.now().astimezone().strftime("%Y-%m-%d")
+    timestamp = datetime.now().astimezone().strftime("%H%M%S%f")
 
     file_name = f"{table_name}_{timestamp}.parquet"
 
@@ -205,7 +205,7 @@ for message in consumer:
 
         if not record:
             print(
-                f"⚠️ DELETE event has no 'before'"
+                "⚠️ DELETE event has no 'before'"
             )
             continue
 
@@ -270,7 +270,7 @@ for message in consumer:
             f"offset={message.offset + 1}"
         )
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
 
         print(
             f"❌ MinIO write failed: {e}"
