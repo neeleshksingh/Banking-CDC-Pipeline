@@ -10,6 +10,7 @@ from airflow.datasets import Dataset
 from airflow.exceptions import AirflowSkipException
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
+from cryptography.hazmat.primitives import serialization
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -25,9 +26,11 @@ MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
 BUCKET = os.getenv("MINIO_BUCKET")
 LOCAL_DIR = os.getenv("MINIO_LOCAL_DIR", "/tmp/minio_downloads")
 
-# -------- Snowflake Config --------
+# -------- Snowflake Config (key-pair auth, least-privilege role) --------
 SNOWFLAKE_USER = os.getenv("SNOWFLAKE_USER")
-SNOWFLAKE_PASSWORD = os.getenv("SNOWFLAKE_PASSWORD")
+SNOWFLAKE_ROLE = os.getenv("SNOWFLAKE_ROLE")
+SNOWFLAKE_PRIVATE_KEY_PATH = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
+SNOWFLAKE_PRIVATE_KEY_PASSPHRASE = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE") or None
 SNOWFLAKE_ACCOUNT = os.getenv("SNOWFLAKE_ACCOUNT")
 SNOWFLAKE_WAREHOUSE = os.getenv("SNOWFLAKE_WAREHOUSE")
 SNOWFLAKE_DB = os.getenv("SNOWFLAKE_DB")
@@ -111,6 +114,27 @@ def copy_failures(table, results):
     return failures
 
 
+def load_private_key(path, passphrase=None):
+    """Read a PKCS#8 PEM private key and return the DER bytes the Snowflake connector expects."""
+    if not path:
+        raise RuntimeError("SNOWFLAKE_PRIVATE_KEY_PATH is not set (see docs/RUNBOOK.md, key-pair setup).")
+    key_file = Path(path)
+    if not key_file.is_file():
+        raise FileNotFoundError(
+            f"Snowflake private key not found at {key_file}. Generate it with `make snowflake-keys` "
+            "and make sure ./keys is mounted into the Airflow containers (see docs/RUNBOOK.md)."
+        )
+    key = serialization.load_pem_private_key(
+        key_file.read_bytes(),
+        password=passphrase.encode() if passphrase else None,
+    )
+    return key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
 # -------- Python Callables --------
 def discover_and_download(**context):
     """Download only MinIO objects not loaded yet. Skips the run if none."""
@@ -158,7 +182,8 @@ def load_to_snowflake(**kwargs):
 
     conn = snowflake.connector.connect(
         user=SNOWFLAKE_USER,
-        password=SNOWFLAKE_PASSWORD,
+        private_key=load_private_key(SNOWFLAKE_PRIVATE_KEY_PATH, SNOWFLAKE_PRIVATE_KEY_PASSPHRASE),
+        role=SNOWFLAKE_ROLE,
         account=SNOWFLAKE_ACCOUNT,
         warehouse=SNOWFLAKE_WAREHOUSE,
         database=SNOWFLAKE_DB,

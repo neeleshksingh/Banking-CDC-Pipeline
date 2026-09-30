@@ -18,6 +18,8 @@ x-airflow-common: &airflow-common
     - ./docker/plugins:/opt/airflow/plugins
     - ./banking_dbt:/opt/airflow/banking_dbt
     - ./banking_dbt/.dbt:/home/airflow/.dbt
+    # Snowflake private key(s) from `make snowflake-keys` (git-ignored)
+    - ./keys:/opt/airflow/keys:ro
   depends_on:
     airflow-postgres:
       condition: service_healthy

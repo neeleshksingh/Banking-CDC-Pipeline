@@ -8,6 +8,14 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
+    # Key-pair auth as the least-privilege CI user (snowflake/security_setup.sql).
+    # Secrets: SNOWFLAKE_ACCOUNT, SNOWFLAKE_CI_USER, SNOWFLAKE_WAREHOUSE,
+    # SNOWFLAKE_PRIVATE_KEY (full PEM of keys/snowflake_ci_key.p8).
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_CI_USER }}
+      SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+
     steps:
       # ------------------------
       # Checkout repo
@@ -19,7 +27,7 @@ jobs:
       # Python setup
       # ------------------------
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -32,24 +40,37 @@ jobs:
           pip install dbt-snowflake
 
       # ------------------------
-      # Configure dbt profile
+      # Snowflake private key -> temp file (outside the checkout, mode 600)
+      # ------------------------
+      - name: Write Snowflake private key
+        env:
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          key_path="$RUNNER_TEMP/snowflake_ci_key.p8"
+          install -m 600 /dev/null "$key_path"
+          printf '%s\n' "$SNOWFLAKE_PRIVATE_KEY" > "$key_path"
+          echo "SNOWFLAKE_PRIVATE_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+
+      # ------------------------
+      # Configure dbt profile (no secrets in the file: env_var only)
       # ------------------------
       - name: Setup dbt profile
         run: |
           mkdir -p ~/.dbt
-          cat > ~/.dbt/profiles.yml <<EOL
+          cat > ~/.dbt/profiles.yml <<'EOL'
           banking_dbt:
             target: prod
             outputs:
               prod:
                 type: snowflake
-                account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-                user: ${{ secrets.SNOWFLAKE_USER }}
-                password: ${{ secrets.SNOWFLAKE_PASSWORD }}
-                role: ACCOUNTADMIN
+                account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+                user: "{{ env_var('SNOWFLAKE_USER') }}"
+                private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+                role: BANKING_CI_ROLE
                 database: BANKING
-                warehouse: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+                warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
                 schema: ANALYTICS
+                threads: 4
           EOL
 
       # ------------------------
@@ -60,3 +81,7 @@ jobs:
           cd banking_dbt
           dbt deps
           dbt build  # models + SCD2 snapshots + tests, in dependency order
+
+      - name: Remove Snowflake private key
+        if: always()
+        run: rm -f "$SNOWFLAKE_PRIVATE_KEY_PATH"
