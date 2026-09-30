@@ -44,6 +44,72 @@ WATERMARK_VAR = "minio_to_snowflake_watermarks"
 LOOKBACK = timedelta(minutes=10)
 COPY_FILES_PER_STATEMENT = 1000  # Snowflake limit for FILES = (...)
 
+# PUT: SKIPPED = identical file already in the stage.
+PUT_OK = {"UPLOADED", "SKIPPED"}
+# COPY: LOAD_SKIPPED = already loaded earlier, per Snowflake load history (idempotent).
+COPY_OK = {"LOADED", "LOAD_SKIPPED"}
+
+
+# -------- Pure helpers (no boto3 / Airflow / Snowflake calls; unit-tested) --------
+def plan_table(objects, table_state, lookback=LOOKBACK):
+    """Pick the keys to load for one table and compute its next watermark state.
+
+    objects: iterable of (key, last_modified) from the MinIO listing.
+    table_state: {"watermark": iso str | None, "recent_keys": [...]} or {}.
+    Returns (new_keys, next_state).
+    """
+    watermark = (
+        datetime.fromisoformat(table_state["watermark"]) if table_state.get("watermark") else None
+    )
+    seen_recent = set(table_state.get("recent_keys", []))
+    since = watermark - lookback if watermark else None
+
+    new_keys, window = [], []
+    for key, modified in objects:
+        if not key.endswith(".parquet"):
+            continue
+        if since and modified < since:
+            continue
+        window.append((key, modified))
+        if key not in seen_recent:
+            new_keys.append(key)
+
+    # Next state: newest LastModified seen, and all keys within the look-back window of it
+    max_modified = max([m for _, m in window], default=watermark)
+    next_state = {
+        "watermark": max_modified.isoformat() if max_modified else None,
+        "recent_keys": sorted(k for k, m in window if max_modified and m >= max_modified - lookback),
+    }
+    return new_keys, next_state
+
+
+def rows_as_dicts(cursor, rows):
+    """Map result rows to {lower-case column name: value} using cursor.description."""
+    columns = [col[0].lower() for col in cursor.description]
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def check_put_results(table, results):
+    """Return the staged file names; raise if any PUT did not upload or skip."""
+    failed = [r for r in results if str(r.get("status")).upper() not in PUT_OK]
+    if failed:
+        details = "; ".join(f"{r.get('source')}: {r.get('status')} {r.get('message') or ''}".strip() for r in failed)
+        raise RuntimeError(f"PUT to @%{table} failed: {details}")
+    return [r["target"] for r in results]
+
+
+def copy_failures(table, results):
+    """Return one message per file whose COPY status is not LOADED / LOAD_SKIPPED."""
+    failures = []
+    for r in results:
+        if "file" not in r:
+            # All listed files were already loaded: Snowflake returns a single
+            # "Copy executed with 0 files processed." row without per-file columns.
+            continue
+        if str(r.get("status")).upper() not in COPY_OK:
+            failures.append(f"{table}: {r['file']} -> {r.get('status')}: {r.get('first_error')}")
+    return failures
+
 
 # -------- Python Callables --------
 def discover_and_download(**context):
@@ -62,24 +128,12 @@ def discover_and_download(**context):
     files, new_state, total = {}, {}, 0
 
     for table in TABLES:
-        table_state = state.get(table, {})
-        watermark = (
-            datetime.fromisoformat(table_state["watermark"]) if table_state.get("watermark") else None
-        )
-        seen_recent = set(table_state.get("recent_keys", []))
-        since = watermark - LOOKBACK if watermark else None
-
-        new_objects, window = [], []
-        for page in paginator.paginate(Bucket=BUCKET, Prefix=f"{table}/"):
-            for obj in page.get("Contents", []):
-                key, modified = obj["Key"], obj["LastModified"]
-                if not key.endswith(".parquet"):
-                    continue
-                if since and modified < since:
-                    continue
-                window.append((key, modified))
-                if key not in seen_recent:
-                    new_objects.append(key)
+        objects = [
+            (obj["Key"], obj["LastModified"])
+            for page in paginator.paginate(Bucket=BUCKET, Prefix=f"{table}/")
+            for obj in page.get("Contents", [])
+        ]
+        new_objects, new_state[table] = plan_table(objects, state.get(table, {}))
 
         files[table] = []
         for key in new_objects:
@@ -91,13 +145,6 @@ def discover_and_download(**context):
             files[table].append(str(local_file))
         total += len(files[table])
         print(f"{table}: {len(files[table])} new file(s)")
-
-        # Next state: newest LastModified seen, and all keys within the look-back window of it
-        max_modified = max([m for _, m in window], default=watermark)
-        new_state[table] = {
-            "watermark": max_modified.isoformat() if max_modified else None,
-            "recent_keys": sorted(k for k, m in window if max_modified and m >= max_modified - LOOKBACK),
-        }
 
     if total == 0:
         # Nothing new: no Snowflake connection, so the warehouse can stay suspended.
@@ -118,6 +165,7 @@ def load_to_snowflake(**kwargs):
         schema=SNOWFLAKE_SCHEMA,
     )
     cur = conn.cursor()
+    failures = []
 
     try:
         for table, files in payload["files"].items():
@@ -133,15 +181,18 @@ def load_to_snowflake(**kwargs):
             staged = []
             for f in files:
                 # PUT skips files that already exist in the stage.
-                for row in cur.execute(f"PUT 'file://{f}' @%{table}").fetchall():
-                    staged.append(row[1])  # target file name in the stage
+                rows = cur.execute(f"PUT 'file://{f}' @%{table}").fetchall()
+                staged.extend(check_put_results(table, rows_as_dicts(cur, rows)))
             print(f"Uploaded {len(staged)} file(s) -> @%{table}")
 
             # Only the files from this run; Snowflake load metadata also
             # skips any file this table has already loaded (idempotent).
+            # ON_ERROR = 'SKIP_FILE' keeps one bad file from blocking the other
+            # files in the same COPY; failed files are collected below and fail
+            # the task, so they are never silently dropped.
             for i in range(0, len(staged), COPY_FILES_PER_STATEMENT):
                 chunk = ", ".join(f"'{name}'" for name in staged[i:i + COPY_FILES_PER_STATEMENT])
-                results = cur.execute(f"""
+                rows = cur.execute(f"""
                     COPY INTO {table} (v, _file_name, _loaded_at)
                     FROM (
                         SELECT $1, METADATA$FILENAME, CURRENT_TIMESTAMP()
@@ -151,16 +202,20 @@ def load_to_snowflake(**kwargs):
                     FILE_FORMAT = (TYPE = PARQUET)
                     ON_ERROR = 'SKIP_FILE'
                 """).fetchall()
+                results = rows_as_dicts(cur, rows)
                 for r in results:
                     print(f"COPY {table}: {r}")
-                    # LOAD_SKIPPED = already loaded earlier (expected, idempotent)
-                    if len(r) > 1 and r[1] in ("LOAD_FAILED", "PARTIALLY_LOADED"):
-                        print(f"⚠️ {table}: file skipped due to errors -> {r}")
+                failures.extend(copy_failures(table, results))
 
             print(f"Data loaded into {table}")
     finally:
         cur.close()
         conn.close()
+
+    # Fail BEFORE the watermark moves: Airflow retries, and the next run
+    # discovers the failed files again (load history skips the good ones).
+    if failures:
+        raise RuntimeError("COPY failed for {} file(s):\n{}".format(len(failures), "\n".join(failures)))
 
     # Advance the watermark only after every table loaded successfully.
     Variable.set(WATERMARK_VAR, payload["state"], serialize_json=True)
