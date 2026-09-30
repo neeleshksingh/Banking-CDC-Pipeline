@@ -68,7 +68,7 @@ You should see the `updated_at` column, the `transactions_*_check` constraints a
 ## 3. Register (or update) the Debezium connector
 
 ```bash
-cd kafka-debezium && ../.venv/bin/python generator_and_post_connector.py && cd ..
+cd kafka-debezium && ../.venv/bin/python register_connector.py && cd ..
 ```
 
 Expect `Connector 'banking-cdc-connector' created` (or `config updated`) and `RUNNING`.
@@ -77,7 +77,7 @@ If it stops with `Connector '...' already uses replication slot 'banking_slot'`,
 (e.g. `banking-postgres-connector`) owns the slot. Replace it:
 
 ```bash
-cd kafka-debezium && ../.venv/bin/python generator_and_post_connector.py --replace && cd ..
+cd kafka-debezium && ../.venv/bin/python register_connector.py --replace && cd ..
 ```
 
 This deletes the old connector (the slot is kept) and registers the new one, which re-snapshots every table.
@@ -229,7 +229,7 @@ The `load_snowflake` log shows `LOAD_SKIPPED ... File was loaded before`, and RA
 This forces Debezium to re-snapshot every table; dbt de-duplicates the resulting events.
 
 ```bash
-cd kafka-debezium && CONNECTOR_NAME=banking-cdc-connector-v2 ../.venv/bin/python generator_and_post_connector.py --replace && cd ..
+cd kafka-debezium && CONNECTOR_NAME=banking-cdc-connector-v2 ../.venv/bin/python register_connector.py --replace && cd ..
 ```
 
 Keep using the new name (`CONNECTOR_NAME=banking-cdc-connector-v2`) for later runs of that script.

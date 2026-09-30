@@ -1,5 +1,4 @@
 #data-generator
-pyyaml
 psycopg2-binary
 faker
 

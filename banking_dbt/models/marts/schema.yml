@@ -8,6 +8,9 @@ models:
         data_tests: [unique, not_null]
       - name: customer_name
         data_tests: [not_null]
+      - name: customer_label
+        description: Unique display name (name + id) used as the Power BI axis / drill-through field.
+        data_tests: [unique, not_null]
       - name: account_mix
         data_tests:
           - accepted_values:

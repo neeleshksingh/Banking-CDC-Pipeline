@@ -1,0 +1,230 @@
+// ============================================================
+// Banking report - all DAX measures
+//
+// How to use (browser, works on Mac - see docs/POWERBI.md step 9):
+//   1. Power BI service -> workspace -> semantic model "..." -> Write DAX queries
+//      (Desktop: DAX query view icon on the left).
+//   2. Paste this whole file, click "Update model with changes": all 49 measures
+//      are added to the model in one go.
+//   3. Click Run to see the test results at the bottom.
+// No DAX query view? Create each MEASURE below via "New measure": copy the
+// text after "MEASURE Table[" as  Name = expression.
+//
+// Conventions
+//   - Money measures count COMPLETED transactions only (FAILED ones moved no money).
+//   - Times are UTC (pipeline stores UTC).
+// ============================================================
+
+DEFINE
+
+    // ---------- Volume ----------
+    MEASURE FACT_TRANSACTIONS[Transaction Count] =
+        COUNTROWS ( FACT_TRANSACTIONS )
+
+    MEASURE FACT_TRANSACTIONS[Completed Transactions] =
+        CALCULATE ( [Transaction Count], KEEPFILTERS ( FACT_TRANSACTIONS[STATUS] = "COMPLETED" ) )
+
+    MEASURE FACT_TRANSACTIONS[Failed Transactions] =
+        CALCULATE ( [Transaction Count], KEEPFILTERS ( FACT_TRANSACTIONS[STATUS] = "FAILED" ) )
+
+    MEASURE FACT_TRANSACTIONS[Failure Rate %] =
+        DIVIDE ( [Failed Transactions], [Transaction Count] )
+
+    // ---------- Value ----------
+    MEASURE FACT_TRANSACTIONS[Transaction Value] =
+        CALCULATE ( SUM ( FACT_TRANSACTIONS[AMOUNT] ), KEEPFILTERS ( FACT_TRANSACTIONS[STATUS] = "COMPLETED" ) )
+
+    MEASURE FACT_TRANSACTIONS[Avg Transaction Value] =
+        DIVIDE ( [Transaction Value], [Completed Transactions] )
+
+    MEASURE FACT_TRANSACTIONS[Largest Transaction] =
+        CALCULATE ( MAX ( FACT_TRANSACTIONS[AMOUNT] ), KEEPFILTERS ( FACT_TRANSACTIONS[STATUS] = "COMPLETED" ) )
+
+    MEASURE FACT_TRANSACTIONS[Deposit Value] =
+        CALCULATE ( [Transaction Value], KEEPFILTERS ( FACT_TRANSACTIONS[TRANSACTION_TYPE] = "DEPOSIT" ) )
+
+    MEASURE FACT_TRANSACTIONS[Withdrawal Value] =
+        CALCULATE ( [Transaction Value], KEEPFILTERS ( FACT_TRANSACTIONS[TRANSACTION_TYPE] = "WITHDRAWAL" ) )
+
+    MEASURE FACT_TRANSACTIONS[Transfer Out Value] =
+        CALCULATE ( [Transaction Value], KEEPFILTERS ( FACT_TRANSACTIONS[TRANSACTION_TYPE] = "TRANSFER" ) )
+
+    // Transfers RECEIVED by the accounts/customers in the current filter.
+    // Uses the inactive relationship FACT_TRANSACTIONS[RELATED_ACCOUNT_ID] -> DIM_ACCOUNTS[ACCOUNT_ID].
+    MEASURE FACT_TRANSACTIONS[Transfer In Value] =
+        CALCULATE (
+            [Transfer Out Value],
+            USERELATIONSHIP ( FACT_TRANSACTIONS[RELATED_ACCOUNT_ID], DIM_ACCOUNTS[ACCOUNT_ID] )
+        )
+
+    // Bank level: transfers stay inside the bank, so only deposits/withdrawals change total holdings
+    MEASURE FACT_TRANSACTIONS[Net External Flow] =
+        [Deposit Value] - [Withdrawal Value]
+
+    // Account / customer level: includes money moved between accounts
+    MEASURE FACT_TRANSACTIONS[Net Account Flow] =
+        [Deposit Value] - [Withdrawal Value] - [Transfer Out Value] + [Transfer In Value]
+
+    MEASURE FACT_TRANSACTIONS[Transfer Share %] =
+        DIVIDE ( [Transfer Out Value], [Transaction Value] )
+
+    MEASURE FACT_TRANSACTIONS[Own-Account Transfer %] =
+        DIVIDE (
+            CALCULATE ( [Transfer Out Value], KEEPFILTERS ( FACT_TRANSACTIONS[IS_OWN_ACCOUNT_TRANSFER] = TRUE () ) ),
+            [Transfer Out Value]
+        )
+
+    // ---------- Customers & accounts ----------
+    MEASURE DIM_CUSTOMERS[Customer Count] =
+        COUNTROWS ( DIM_CUSTOMERS )
+
+    MEASURE DIM_ACCOUNTS[Account Count] =
+        COUNTROWS ( DIM_ACCOUNTS )
+
+    // Point-in-time balance as of the last pipeline run (not affected by the date slicer)
+    MEASURE DIM_ACCOUNTS[Total Balance] =
+        SUM ( DIM_ACCOUNTS[BALANCE] )
+
+    MEASURE DIM_ACCOUNTS[Avg Balance] =
+        AVERAGE ( DIM_ACCOUNTS[BALANCE] )
+
+    MEASURE FACT_TRANSACTIONS[Active Accounts] =
+        DISTINCTCOUNT ( FACT_TRANSACTIONS[ACCOUNT_ID] )
+
+    MEASURE FACT_TRANSACTIONS[Active Customers] =
+        DISTINCTCOUNT ( FACT_TRANSACTIONS[CUSTOMER_ID] )
+
+    MEASURE FACT_TRANSACTIONS[Active Account %] =
+        DIVIDE ( [Active Accounts], [Account Count] )
+
+    MEASURE FACT_TRANSACTIONS[Dormant Accounts] =
+        [Account Count] - [Active Accounts]
+
+    MEASURE FACT_TRANSACTIONS[Value per Active Customer] =
+        DIVIDE ( [Transaction Value], [Active Customers] )
+
+    MEASURE FACT_TRANSACTIONS[Transactions per Active Customer] =
+        DIVIDE ( [Transaction Count], [Active Customers] )
+
+    // Customers who joined in the selected dates (no relationship needed: TREATAS)
+    MEASURE DIM_CUSTOMERS[New Customers] =
+        CALCULATE (
+            [Customer Count],
+            TREATAS ( VALUES ( DIM_DATE[DATE] ), DIM_CUSTOMERS[CREATED_DATE] )
+        )
+
+    // ---------- Time intelligence (needs DIM_DATE marked as date table) ----------
+    MEASURE FACT_TRANSACTIONS[Last Data Date] =
+        CALCULATE ( MAX ( FACT_TRANSACTIONS[TRANSACTION_DATE] ), REMOVEFILTERS () )
+
+    MEASURE FACT_TRANSACTIONS[Value Prev Day] =
+        CALCULATE ( [Transaction Value], DATEADD ( DIM_DATE[DATE], -1, DAY ) )
+
+    MEASURE FACT_TRANSACTIONS[Value Prev Month] =
+        CALCULATE ( [Transaction Value], DATEADD ( DIM_DATE[DATE], -1, MONTH ) )
+
+    MEASURE FACT_TRANSACTIONS[MoM Change] =
+        IF ( NOT ISBLANK ( [Value Prev Month] ), [Transaction Value] - [Value Prev Month] )
+
+    MEASURE FACT_TRANSACTIONS[MoM %] =
+        DIVIDE ( [MoM Change], [Value Prev Month] )
+
+    MEASURE FACT_TRANSACTIONS[Value MTD] =
+        CALCULATE ( [Transaction Value], DATESMTD ( DIM_DATE[DATE] ) )
+
+    // Blank after the last day with data, so lines don't run into empty future dates
+    MEASURE FACT_TRANSACTIONS[Rolling 7D Value] =
+        IF (
+            MAX ( DIM_DATE[DATE] ) <= [Last Data Date],
+            CALCULATE ( [Transaction Value], DATESINPERIOD ( DIM_DATE[DATE], MAX ( DIM_DATE[DATE] ), -7, DAY ) )
+        )
+
+    MEASURE FACT_TRANSACTIONS[Rolling 30D Value] =
+        IF (
+            MAX ( DIM_DATE[DATE] ) <= [Last Data Date],
+            CALCULATE ( [Transaction Value], DATESINPERIOD ( DIM_DATE[DATE], MAX ( DIM_DATE[DATE] ), -30, DAY ) )
+        )
+
+    // ---------- Pipeline monitoring ----------
+    MEASURE MON_PIPELINE_FRESHNESS[Latest Transaction UTC] =
+        MAX ( MON_PIPELINE_FRESHNESS[LATEST_TRANSACTION_TIME_UTC] )
+
+    MEASURE MON_PIPELINE_FRESHNESS[Last Warehouse Load UTC] =
+        MAX ( MON_PIPELINE_FRESHNESS[LAST_RAW_LOAD_UTC] )
+
+    MEASURE MON_PIPELINE_FRESHNESS[Last dbt Build UTC] =
+        MAX ( MON_PIPELINE_FRESHNESS[BUILT_AT_UTC] )
+
+    // Evaluated when the report is viewed: how old the loaded data is
+    MEASURE MON_PIPELINE_FRESHNESS[Minutes Since Last Load] =
+        DATEDIFF ( [Last Warehouse Load UTC], UTCNOW (), MINUTE )
+
+    MEASURE MON_PIPELINE_FRESHNESS[Freshness Status] =
+        VAR m = [Minutes Since Last Load]
+        RETURN
+            SWITCH ( TRUE (), ISBLANK ( m ), "No data", m <= 15, "Fresh", m <= 60, "Delayed", "Stale" )
+
+    MEASURE FCT_CDC_EVENTS[CDC Events] =
+        COUNTROWS ( FCT_CDC_EVENTS )
+
+    MEASURE FCT_CDC_EVENTS[Inserts] =
+        CALCULATE ( [CDC Events], KEEPFILTERS ( FCT_CDC_EVENTS[CDC_OPERATION] = "c" ) )
+
+    MEASURE FCT_CDC_EVENTS[Updates] =
+        CALCULATE ( [CDC Events], KEEPFILTERS ( FCT_CDC_EVENTS[CDC_OPERATION] = "u" ) )
+
+    MEASURE FCT_CDC_EVENTS[Deletes] =
+        CALCULATE ( [CDC Events], KEEPFILTERS ( FCT_CDC_EVENTS[CDC_OPERATION] = "d" ) )
+
+    MEASURE FCT_CDC_EVENTS[Snapshot Reads] =
+        CALCULATE ( [CDC Events], KEEPFILTERS ( FCT_CDC_EVENTS[CDC_OPERATION] = "r" ) )
+
+    MEASURE FCT_CDC_EVENTS[Median Ingest Latency (s)] =
+        MEDIAN ( FCT_CDC_EVENTS[INGEST_LATENCY_SECONDS] )
+
+    MEASURE FCT_CDC_EVENTS[P95 Ingest Latency (s)] =
+        PERCENTILEX.INC (
+            FILTER ( FCT_CDC_EVENTS, NOT ISBLANK ( FCT_CDC_EVENTS[INGEST_LATENCY_SECONDS] ) ),
+            FCT_CDC_EVENTS[INGEST_LATENCY_SECONDS],
+            0.95
+        )
+
+    // ---------- Data quality (should all be 0) ----------
+    MEASURE FACT_TRANSACTIONS[DQ Orphan Transactions] =
+        COUNTROWS ( FILTER ( FACT_TRANSACTIONS, ISBLANK ( RELATED ( DIM_ACCOUNTS[ACCOUNT_ID] ) ) ) ) + 0
+
+    MEASURE FACT_TRANSACTIONS[DQ Invalid Types] =
+        COUNTROWS (
+            FILTER (
+                FACT_TRANSACTIONS,
+                NOT ( FACT_TRANSACTIONS[TRANSACTION_TYPE] IN { "DEPOSIT", "WITHDRAWAL", "TRANSFER" } )
+            )
+        ) + 0
+
+    MEASURE FACT_TRANSACTIONS[DQ Non-Positive Amounts] =
+        COUNTROWS ( FILTER ( FACT_TRANSACTIONS, FACT_TRANSACTIONS[AMOUNT] <= 0 ) ) + 0
+
+// ---------- Test: run this query to check the measures ----------
+EVALUATE
+    ROW (
+        "Transaction Count", [Transaction Count],
+        "Transaction Value", [Transaction Value],
+        "Failure Rate %", [Failure Rate %],
+        "Net External Flow", [Net External Flow],
+        "Customers", [Customer Count],
+        "Accounts", [Account Count],
+        "Total Balance", [Total Balance],
+        "Active Accounts", [Active Accounts],
+        "Last Data Date", [Last Data Date],
+        "Freshness", [Freshness Status],
+        "DQ Orphans", [DQ Orphan Transactions],
+        "DQ Invalid Types", [DQ Invalid Types]
+    )
+
+EVALUATE
+    SUMMARIZECOLUMNS (
+        FACT_TRANSACTIONS[TRANSACTION_TYPE],
+        "Count", [Transaction Count],
+        "Value", [Transaction Value],
+        "Transfer In", [Transfer In Value]
+    )

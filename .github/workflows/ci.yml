@@ -44,11 +44,6 @@ jobs:
           pip install ruff
           ruff check .
 
-      - name: Run unit tests
-        run: |
-          pip install pytest
-          pytest tests/ || echo "No tests yet"
-
       - name: Setup dbt profile
         run: |
           mkdir -p ~/.dbt

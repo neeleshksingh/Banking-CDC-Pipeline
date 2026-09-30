@@ -15,7 +15,6 @@ banking_dbt/dbt_packages/
 
 .env
 .venv
-.claude
 __pycache__/
 *.pyc
 .vscode/
@@ -23,5 +22,7 @@ __pycache__/
 .DS_Store
 docker-compose.override.yml
 logs/
+docs/
+
 
 minio.license

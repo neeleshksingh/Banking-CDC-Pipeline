@@ -22,6 +22,8 @@ select
     c.first_name,
     c.last_name,
     c.first_name || ' ' || c.last_name           as customer_name,
+    -- Unique display name for charts / drill-through (names can repeat)
+    c.first_name || ' ' || c.last_name || ' #' || c.customer_id   as customer_label,
     c.email,
     c.created_at,
     c.created_at::date                           as created_date,
