@@ -2,7 +2,7 @@
 -- Expected values for the Power BI measures (no slicers applied).
 -- Run in Snowsight right after a Power BI refresh: the report's KPI
 -- cards must show the same numbers. If they don't, a relationship or
--- measure is wrong (see docs/POWERBI.md -> "Check your numbers").
+-- measure is wrong (see docs/RUNBOOK.md, Power BI).
 -- ============================================================
 
 use database BANKING;

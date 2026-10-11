@@ -3,9 +3,7 @@ version: '1.0.0'
 profile: 'banking_dbt'
 
 model-paths: ["models"]
-analysis-paths: ["analyses"]
 test-paths: ["tests"]
-seed-paths: ["seeds"]
 snapshot-paths: ["snapshots"]
 macro-paths: ["macros"]
 

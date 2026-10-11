@@ -5,9 +5,6 @@ import time
 import requests
 from dotenv import load_dotenv
 
-# -----------------------------
-# Load environment variables
-# -----------------------------
 load_dotenv()
 
 CONNECT_URL = os.getenv("CONNECT_URL", "http://localhost:8083")
@@ -25,9 +22,6 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-# -----------------------------
-# Connector config
-# -----------------------------
 connector_config = {
     "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
     "database.hostname": os.getenv("POSTGRES_HOST"),
@@ -48,9 +42,7 @@ connector_config = {
     "decimal.handling.mode": "string",
 }
 
-# -----------------------------
-# Guard: one replication slot = one connector
-# -----------------------------
+# Two connectors cannot share one replication slot.
 for name in requests.get(f"{CONNECT_URL}/connectors", timeout=30).json():
     if name == CONNECTOR_NAME:
         continue
@@ -59,44 +51,38 @@ for name in requests.get(f"{CONNECT_URL}/connectors", timeout=30).json():
         continue
     if not args.replace:
         print(
-            f"❌ Connector '{name}' already uses replication slot '{SLOT_NAME}'.\n"
+            f"Connector '{name}' already uses replication slot '{SLOT_NAME}'.\n"
             f"   Re-run with --replace to delete it and register '{CONNECTOR_NAME}' "
             "(this triggers a full re-snapshot of all tables)."
         )
         raise SystemExit(1)
     requests.delete(f"{CONNECT_URL}/connectors/{name}", timeout=30).raise_for_status()
-    print(f"🗑️  Deleted old connector '{name}' (replication slot kept).")
+    print(f"Deleted old connector '{name}' (replication slot kept).")
     time.sleep(5)  # let the old task release the slot
 
-# -----------------------------
-# Create or update (idempotent)
-# -----------------------------
 # PUT /connectors/{name}/config creates the connector if missing,
 # otherwise updates its config in place (keeps stored offsets).
 url = f"{CONNECT_URL}/connectors/{CONNECTOR_NAME}/config"
 response = requests.put(url, json=connector_config, timeout=30)
 
 if response.status_code == 201:
-    print(f"✅ Connector '{CONNECTOR_NAME}' created successfully!")
+    print(f"Connector '{CONNECTOR_NAME}' created.")
 elif response.status_code == 200:
-    print(f"✅ Connector '{CONNECTOR_NAME}' config updated.")
+    print(f"Connector '{CONNECTOR_NAME}' config updated.")
 else:
-    print(f"❌ Failed to create/update connector ({response.status_code}): {response.text}")
+    print(f"Failed to create/update connector ({response.status_code}): {response.text}")
     raise SystemExit(1)
 
-# -----------------------------
-# Wait for RUNNING
-# -----------------------------
 for _ in range(20):
     status = requests.get(f"{CONNECT_URL}/connectors/{CONNECTOR_NAME}/status", timeout=30).json()
     tasks = status.get("tasks", [])
     states = [status.get("connector", {}).get("state")] + [t.get("state") for t in tasks]
     if tasks and all(s == "RUNNING" for s in states):
-        print(f"✅ Connector and task are RUNNING: {status}")
+        print(f"Connector and task are RUNNING: {status}")
         break
     if "FAILED" in states:
-        print(f"❌ Connector FAILED: {status}")
+        print(f"Connector FAILED: {status}")
         raise SystemExit(1)
     time.sleep(3)
 else:
-    print(f"⚠️  Not RUNNING yet, check again: curl {CONNECT_URL}/connectors/{CONNECTOR_NAME}/status")
+    print(f"Not RUNNING yet, check again: curl {CONNECT_URL}/connectors/{CONNECTOR_NAME}/status")

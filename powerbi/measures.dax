@@ -1,7 +1,7 @@
 // ============================================================
 // Banking report - all DAX measures
 //
-// How to use (browser, works on Mac - see docs/POWERBI.md step 9):
+// How to use (browser, works on Mac - see docs/RUNBOOK.md, Power BI):
 //   1. Power BI service -> workspace -> semantic model "..." -> Write DAX queries
 //      (Desktop: DAX query view icon on the left).
 //   2. Paste this whole file, click "Update model with changes": all 49 measures
