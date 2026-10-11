@@ -10,8 +10,9 @@ Postgres ──WAL──▶ Debezium ──▶ Kafka ──▶ consumer (Docker)
                          Airflow: dbt_banking_build ──▶ STAGING (views) ──▶ ANALYTICS (snapshots, dims, facts, monitoring)
 ```
 
-Expected end-to-end latency for a new Postgres row: roughly **2–4 minutes**
-(10 s consumer flush + ≤1 min Airflow schedule + ~1–2 min `dbt build`).
+Expected end-to-end latency for a new Postgres row: about **1 minute**
+(10 s consumer flush + 0–60 s wait for the next Airflow load + ~6 s `COPY INTO` + ~17 s `dbt build`);
+a large backfill can take ~3 minutes.
 
 All commands run from the repository root unless stated otherwise.
 
@@ -370,7 +371,7 @@ Balances are current values, so the date slicer doesn't change them.
 semantic model **⋯ → Refresh now**: the deposit tops *Largest transactions*, customer #1's Customer Detail
 page shows the new email version, and Pipeline Health shows `Fresh`.
 
-The dashboard is as fresh as its last refresh: the pipeline is near-real-time (2–4 min to Snowflake), the
+The dashboard is as fresh as its last refresh: the pipeline is near-real-time (about 1 min to Snowflake), the
 report is not.
 
 ---
