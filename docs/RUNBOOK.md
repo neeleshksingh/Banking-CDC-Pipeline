@@ -310,7 +310,9 @@ with Pro or a trial.
    `PBI_WH` · **Advanced options → Role:** `PBI_READER`.
 3. **Credentials:** no gateway · **Authentication kind:** Key pair · **Username:** `PBI_SVC` · **Private key:**
    the full contents of `keys/snowflake_pbi_key.p8` including the `BEGIN` / `END` lines
-   (`pbcopy < keys/snowflake_pbi_key.p8` copies it) · passphrase empty.
+   (`pbcopy < keys/snowflake_pbi_key.p8` copies it) · passphrase empty. If the form shows **Browse files**
+   instead of a text box, upload `keys/snowflake_pbi_key.p8` (in the Mac file picker, ⌘⇧G and type the
+   project's `keys` folder path).
 4. Under `BANKING → ANALYTICS` select `FACT_TRANSACTIONS`, `DIM_CUSTOMERS`, `DIM_ACCOUNTS`, `DIM_DATE`,
    `DIM_CUSTOMERS_HISTORY`, `FCT_CDC_EVENTS`, `MON_PIPELINE_FRESHNESS` → **Create** → **Create a semantic model
    only**.

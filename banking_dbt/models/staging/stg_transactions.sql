@@ -14,6 +14,8 @@ with events as (
         v:status::string                           as status,
         v:created_at::timestamp_ntz                as transaction_time,
         v:updated_at::timestamp_ntz                as updated_at,
+        -- Rows without CDC metadata predate the consumer's CDC fields and were plain
+        -- inserts, so they count as 'c' here; monitoring labels them 'legacy'.
         coalesce(v:_cdc_operation::string, 'c')    as cdc_operation,
         v:_source_lsn::number                      as source_lsn,
         v:_kafka_offset::number                    as kafka_offset,
