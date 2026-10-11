@@ -12,10 +12,11 @@ A change-data-capture (CDC) pipeline for a simulated bank. Every insert, update 
 database is captured from the write-ahead log, landed in object storage, loaded into Snowflake and modelled
 with dbt into a tested star schema with SCD Type-2 history. A Power BI report sits on top.
 
-Measured from the Postgres commit to the Snowflake `RAW` load, the median latency is **97 s** (P95 **159 s**,
-from `FCT_CDC_EVENTS`); the `dbt build` that follows takes about 30 s, so a change reaches the analytics tables
-in about **2 minutes**. Capture is streaming; the warehouse load and transformations are micro-batches, so this
-is near-real-time rather than streaming analytics.
+Measured from the Postgres commit to the Snowflake `RAW` load, live changes land with a median latency of
+**56 s** (P95 **68 s**, small live loads in `FCT_CDC_EVENTS`); the `dbt build` that follows takes about 17 s, so
+a change reaches the analytics tables in about **1 minute** (54–60 s in three single-row tests). Bulk backfills
+are slower: ~119k events loaded with a median of 98 s (P95 159 s). Capture is streaming; the warehouse load and
+transformations are micro-batches, so this is near-real-time rather than streaming analytics.
 
 ## Architecture
 
@@ -34,10 +35,10 @@ flowchart LR
 
 | Stage | Mechanism | Latency |
 | --- | --- | --- |
-| Change capture | Postgres WAL → Debezium → Kafka | seconds |
-| Landing | Kafka → consumer → MinIO | ~10 s batches |
-| Warehouse load | Airflow → `PUT` + `COPY INTO` | ≤ 1 min |
-| Transformation | Airflow Dataset → `dbt build` | ~30 s per build |
+| Change capture | Postgres WAL → Debezium → Kafka | < 1 s |
+| Landing | Kafka → consumer → MinIO | ~10 s batches (or 500 records) |
+| Warehouse load | Airflow → `PUT` + `COPY INTO` | runs every minute; ~6–12 s per load |
+| Transformation | Airflow Dataset → `dbt build` | ~17 s per build |
 | Reporting | Power BI Import, scheduled refresh | per refresh |
 
 ## Data model (`BANKING.ANALYTICS`)
@@ -76,7 +77,7 @@ More pages: [Transactions](docs/images/powerbi/02-transactions.png) ·
 
 | What | Evidence |
 | --- | --- |
-| Latency | Median **97 s**, P95 **159 s** from Postgres commit to Snowflake `RAW`; ~2 min to the analytics tables |
+| Latency | Live changes: median **56 s**, P95 **68 s** from Postgres commit to Snowflake `RAW`; ~1 min to the analytics tables. Bulk backfills (~119k events): median 98 s, P95 159 s |
 | Data quality | 49 dbt data tests on every build; data-quality cards in the report show 0 orphans, invalid types and non-positive amounts |
 | Correctness | Mart row counts equal Postgres after the pipeline is idle; report KPIs match SQL recomputed in [`powerbi_expected_values.sql`](snowflake/powerbi_expected_values.sql) |
 | No loss | With MinIO stopped mid-stream, the consumer rewinds instead of committing; counts still match after recovery |
