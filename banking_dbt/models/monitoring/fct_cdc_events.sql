@@ -1,7 +1,8 @@
 {{ config(materialized='table') }}
 
 -- Grain: one row per CDC event landed in RAW (all tables).
--- Rows loaded before the consumer added CDC metadata show cdc_operation = 'legacy'.
+-- Rows loaded before the consumer added CDC metadata show cdc_operation = 'legacy';
+-- rows loaded before the _loaded_at audit column existed have no load time / load_date.
 
 {% for table in ['customers', 'accounts', 'transactions'] %}
 select
@@ -11,6 +12,7 @@ select
     to_timestamp_ntz(v:_source_ts_ms::number, 3)                   as source_committed_at_utc,
     to_timestamp_ntz(v:_cdc_ts_ms::number, 3)                      as captured_at_utc,
     convert_timezone('UTC', _loaded_at)::timestamp_ntz             as raw_loaded_at_utc,
+    convert_timezone('UTC', _loaded_at)::date                      as load_date,
     datediff(
         'second',
         to_timestamp_ntz(v:_source_ts_ms::number, 3),

@@ -9,6 +9,8 @@ models:
           - accepted_values:
               arguments:
                 values: ['r', 'c', 'u', 'd', 'legacy']
+      - name: load_date
+        description: UTC date the event was loaded into RAW (null for rows loaded before _loaded_at existed).
 
   - name: mon_pipeline_freshness
     description: One row per source table with event counts and freshness timestamps.
