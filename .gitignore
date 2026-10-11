@@ -1,36 +1,32 @@
-# GitHub Actions cache
-/.github/.cache
+# Secrets: .env files and Snowflake keys (make snowflake-keys)
+.env
+keys/
+*.p8
+*.pem
+minio.license
 
-# Docker cache
+# Docker volumes and logs
 docker/logs/
 docker/minio/
-docker/plugins/
 docker/postgres/
+docker-compose.override.yml
+logs/
 
-# DBT cache (macros/, tests/, seeds/, analyses/ are source code: keep them tracked)
+# dbt: local profile and build output
 banking_dbt/.dbt/
 banking_dbt/logs/
 banking_dbt/target/
 banking_dbt/dbt_packages/
 
-.env
+# Python
 .venv
-
-# Snowflake key-pair auth (make snowflake-keys)
-keys/
-*.p8
-*.pem
 __pycache__/
 *.pyc
+.coverage
+.pytest_cache/
+.ruff_cache/
+
+# Editors / OS
 .vscode/
 .idea/
 .DS_Store
-docker-compose.override.yml
-logs/
-docs/
-
-
-minio.license
-# Test artifacts
-.coverage
-.pytest_cache/

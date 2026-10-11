@@ -1,7 +1,7 @@
 -- ============================================================
 -- Least-privilege role + key-pair service users for the pipeline.
 -- Run manually in Snowsight as ACCOUNTADMIN ("Run All"). Idempotent:
--- safe to re-run. Replaces the password login with ACCOUNTADMIN.
+-- safe to re-run. No passwords and no ACCOUNTADMIN at runtime.
 --
 --   BANKING_PIPELINE_ROLE / BANKING_PIPELINE_USER  -> Airflow (COPY + dbt)
 --   BANKING_CI_ROLE       / BANKING_CI_USER        -> GitHub Actions CD (dbt build)
@@ -9,7 +9,7 @@
 -- After running it:
 --   1. `make snowflake-keys` (and `make snowflake-keys KEY_NAME=snowflake_ci_key SF_USER=BANKING_CI_USER`)
 --      prints the ALTER USER ... SET RSA_PUBLIC_KEY statements to run (section 6).
---   2. Transfer ownership of the existing objects (section 7), once.
+--   2. Only if BANKING already has objects created by another role: section 7, once.
 -- ============================================================
 
 use role ACCOUNTADMIN;
@@ -102,9 +102,9 @@ grant role BANKING_CI_ROLE to user BANKING_CI_USER;
 -- describe user BANKING_PIPELINE_USER;
 
 -- ------------------------------------------------------------
--- 7. ONE-TIME: hand existing objects to the pipeline role (NOT run by default)
+-- 7. Existing objects only: hand them to the pipeline role (NOT run by default)
 -- ------------------------------------------------------------
--- Objects created so far are owned by ACCOUNTADMIN (the old login). The
+-- Objects created before this script (e.g. by ACCOUNTADMIN) keep their owner. The
 -- pipeline role must own them to PUT into @%table, ALTER the RAW tables and
 -- `create or replace` the dbt models / snapshots. COPY CURRENT GRANTS keeps
 -- existing grants (e.g. PBI_READER SELECT). Review, then uncomment and run:

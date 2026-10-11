@@ -53,6 +53,23 @@ flowchart LR
 `STAGING` derives the current state of each record from it. dbt runs 49 data tests on every build
 (46 generic tests in the `schema.yml` files + 3 singular tests in `banking_dbt/tests/`).
 
+## Dashboard
+
+Power BI report on `BANKING.ANALYTICS` (Import mode, scheduled refresh), built in the browser. All 49 DAX
+measures are in [`powerbi/measures.dax`](powerbi/measures.dax), and
+[`snowflake/powerbi_expected_values.sql`](snowflake/powerbi_expected_values.sql) recomputes the headline
+numbers in SQL to check the report against the warehouse.
+
+![Banking Overview](docs/images/powerbi/01-overview.png)
+
+| Pipeline health | Customer drill-through with SCD2 history |
+| --- | --- |
+| ![Pipeline Health](docs/images/powerbi/05-pipeline-health.png) | ![Customer Detail](docs/images/powerbi/06-customer-detail-scd2.png) |
+
+More pages: [Transactions](docs/images/powerbi/02-transactions.png) ·
+[Customers](docs/images/powerbi/03-customers.png) · [Accounts](docs/images/powerbi/04-accounts.png) ·
+[Star schema in the semantic model](docs/images/powerbi/07-star-schema-model.png)
+
 ## Design decisions
 
 - **Append-only RAW, CDC applied in dbt.** Loading events as-is keeps the full history and makes loads
@@ -71,8 +88,10 @@ flowchart LR
   retries, and later runs rediscover the file, so nothing is silently dropped.
 - **Key-pair auth with a least-privilege role.** Airflow and dbt log in as a `TYPE = SERVICE` user with a
   private key and `BANKING_PIPELINE_ROLE` (usage on one warehouse and database, create/insert in `RAW`,
-  create views/tables in `STAGING` / `ANALYTICS`). CD uses its own `BANKING_CI_USER` / `BANKING_CI_ROLE`.
-  No passwords and no `ACCOUNTADMIN` at runtime ([`snowflake/security_setup.sql`](snowflake/security_setup.sql)).
+  create views/tables in `STAGING` / `ANALYTICS`). CD uses its own `BANKING_CI_USER` / `BANKING_CI_ROLE`,
+  and Power BI refreshes as `PBI_SVC` with the read-only `PBI_READER` role on `ANALYTICS` only.
+  No passwords and no `ACCOUNTADMIN` at runtime ([`snowflake/security_setup.sql`](snowflake/security_setup.sql),
+  [`snowflake/powerbi_setup.sql`](snowflake/powerbi_setup.sql)).
 - **Consumer in Docker, testable by design.** The consumer runs as a compose service and handles `SIGTERM`
   (flush, then commit) so `docker stop` loses nothing. Kafka and S3 clients are injected, so the flush /
   commit / rewind logic is unit-tested with fakes; CI runs ruff, pytest and an offline `dbt parse`.
@@ -121,12 +140,12 @@ flowchart LR
 banking_dbt/         dbt project: staging, snapshots, marts, monitoring, tests, macros
 consumer/            kafka_to_minio.py: Kafka → MinIO Parquet writer; Dockerfile, pinned requirements.txt
 data-generator/      faker_generator.py: balance-aware banking simulator (live + backfill)
-docker/dags/         minio_to_snowflake_dag.py, dbt_banking_build.py
-docs/                RUNBOOK.md (run & test)
+docker/              airflow.Dockerfile (Airflow + dbt); dags/: minio_to_snowflake_dag.py, dbt_banking_build.py
+docs/                RUNBOOK.md (run, test, Power BI setup), images/powerbi/ (report screenshots)
 kafka-debezium/      register_connector.py: creates/updates the Debezium connector
 postgres/            schema.sql: source DDL (constraints, indexes, CDC settings)
-powerbi/             measures.dax
-snowflake/           security_setup.sql (role, service users), Power BI setup, cleanup and verification SQL
+powerbi/             measures.dax (all report measures, pasted into the model in one step)
+snowflake/           security_setup.sql (roles, service users), powerbi_setup.sql, verification SQL
 tests/               pytest unit tests for the consumer and the load DAG (no Docker or Snowflake needed)
 keys/                Snowflake private keys from `make snowflake-keys` (git-ignored)
 Makefile             snowflake-keys: generate the key pair and print the ALTER USER statement
@@ -138,5 +157,6 @@ Tests: `pip install -r requirements-dev.txt && pytest` (coverage for the consume
 
 ## Running it
 
-- [docs/RUNBOOK.md](docs/RUNBOOK.md): Snowflake key-pair setup, start the stack, verify each hop, and run
-  hands-on CDC tests (insert, update, SCD2, delete, storage outage, idempotent reload).
+- [docs/RUNBOOK.md](docs/RUNBOOK.md): Snowflake key-pair setup, start the stack, verify each hop, run
+  hands-on CDC tests (insert, update, SCD2, delete, storage outage, idempotent reload), and build the
+  Power BI report.

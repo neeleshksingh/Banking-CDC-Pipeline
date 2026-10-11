@@ -2,7 +2,19 @@ name: CD
 
 on:
   push:
-    branches: [ main ]   # deploy only from main
+    branches: [ main ]
+    paths:
+      - "banking_dbt/**"
+      - ".github/workflows/cd.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One prod deploy at a time; a newer push waits instead of racing the running build.
+concurrency:
+  group: cd-prod
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -17,31 +29,18 @@ jobs:
       SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
 
     steps:
-      # ------------------------
-      # Checkout repo
-      # ------------------------
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ------------------------
-      # Python setup
-      # ------------------------
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ------------------------
-      # Install dbt
-      # ------------------------
-      - name: Install dbt Snowflake adapter
+      # Same dbt versions as the Airflow image (docker/airflow.Dockerfile)
+      - name: Install dbt
         run: |
           python -m pip install --upgrade pip
-          pip install dbt-snowflake
+          pip install dbt-core==1.12.5 dbt-snowflake==1.12.1
 
-      # ------------------------
-      # Snowflake private key -> temp file (outside the checkout, mode 600)
-      # ------------------------
       - name: Write Snowflake private key
         env:
           SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
@@ -51,10 +50,8 @@ jobs:
           printf '%s\n' "$SNOWFLAKE_PRIVATE_KEY" > "$key_path"
           echo "SNOWFLAKE_PRIVATE_KEY_PATH=$key_path" >> "$GITHUB_ENV"
 
-      # ------------------------
-      # Configure dbt profile (no secrets in the file: env_var only)
-      # ------------------------
-      - name: Setup dbt profile
+      # No secrets in the file: values come from env_var()
+      - name: Write dbt profile
         run: |
           mkdir -p ~/.dbt
           cat > ~/.dbt/profiles.yml <<'EOL'
@@ -73,14 +70,9 @@ jobs:
                 threads: 4
           EOL
 
-      # ------------------------
-      # Deploy dbt project
-      # ------------------------
       - name: dbt build (prod)
-        run: |
-          cd banking_dbt
-          dbt deps
-          dbt build  # models + SCD2 snapshots + tests, in dependency order
+        working-directory: banking_dbt
+        run: dbt build  # models + SCD2 snapshots + tests, in dependency order
 
       - name: Remove Snowflake private key
         if: always()

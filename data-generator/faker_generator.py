@@ -15,18 +15,13 @@ from faker import Faker
 
 load_dotenv()
 
-# -----------------------------
-# Project configuration (safe to hardcode here)
-# -----------------------------
 CURRENCY = "USD"
 ACCOUNTS_PER_CUSTOMER = 2
 MAX_TXN_AMOUNT = Decimal("5000.00")
 
-# Non-zero initial balances
 INITIAL_BALANCE_MIN = Decimal("100.00")
 INITIAL_BALANCE_MAX = Decimal("5000.00")
 
-# Transaction mix (weights)
 TXN_TYPES = ["DEPOSIT", "WITHDRAWAL", "TRANSFER"]
 TXN_WEIGHTS = [0.40, 0.35, 0.25]
 
@@ -34,9 +29,6 @@ TXN_WEIGHTS = [0.40, 0.35, 0.25]
 # (exercises CDC UPDATE events and the SCD2 customer snapshot)
 CUSTOMER_UPDATE_PROBABILITY = 0.5
 
-# -----------------------------
-# CLI
-# -----------------------------
 parser = argparse.ArgumentParser(description="Run fake banking data generator")
 parser.add_argument("--once", action="store_true", help="Run a single iteration and exit")
 parser.add_argument("--iterations", type=int, default=0, help="Stop after N iterations (0 = run forever)")
@@ -57,9 +49,6 @@ if args.once:
 if args.backfill_days and not args.iterations:
     parser.error("--backfill-days requires --iterations (e.g. --iterations 200)")
 
-# -----------------------------
-# Helpers
-# -----------------------------
 fake = Faker()
 
 
@@ -79,9 +68,6 @@ def unique_email(first_name: str, last_name: str) -> str:
     return f"{first_name}.{last_name}.{uuid.uuid4().hex[:8]}@{fake.free_email_domain()}".lower()
 
 
-# -----------------------------
-# Connect to Postgres
-# -----------------------------
 conn = psycopg2.connect(
     host=os.getenv("POSTGRES_HOST"),
     port=os.getenv("POSTGRES_PORT"),
@@ -95,9 +81,6 @@ conn.autocommit = False
 cur = conn.cursor()
 
 
-# -----------------------------
-# Entity creation
-# -----------------------------
 def create_customers(n: int, ts: datetime | None) -> list[int]:
     customer_ids = []
     for _ in range(n):
@@ -134,9 +117,6 @@ def create_accounts(customer_ids: list[int], ts: datetime | None) -> list[int]:
     return account_ids
 
 
-# -----------------------------
-# Transactions (balance-aware)
-# -----------------------------
 def post_transaction(account_id: int, txn_type: str, amount: Decimal, related_account: int | None,
                      ts: datetime | None) -> str:
     """Insert one transaction and apply it to balances in a single DB transaction.
@@ -184,9 +164,6 @@ def update_random_customer():
     return customer_id
 
 
-# -----------------------------
-# Core generation logic (one iteration)
-# -----------------------------
 def load_existing_accounts() -> list[int]:
     cur.execute("SELECT id FROM accounts")
     ids = [r[0] for r in cur.fetchall()]
@@ -219,16 +196,13 @@ def run_iteration(account_pool: list[int], base_ts: datetime | None):
         updated = update_random_customer()
 
     print(
-        f"✅ {len(customers)} customers, {len(new_accounts)} accounts, "
+        f"{len(customers)} customers, {len(new_accounts)} accounts, "
         f"{stats['COMPLETED']} completed / {stats['FAILED']} failed transactions"
         + (f", updated customer {updated}" if updated else "")
         + (f" @ {base_ts:%Y-%m-%d %H:%M}" if base_ts else "")
     )
 
 
-# -----------------------------
-# Main loop
-# -----------------------------
 try:
     if args.backfill_days:
         # Chronological spread so accounts always exist before their transactions.

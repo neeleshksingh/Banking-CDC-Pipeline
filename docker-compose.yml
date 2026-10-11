@@ -170,7 +170,7 @@ services:
     <<: *airflow-common
     build:
       context: .
-      dockerfile: dockerfile-airflow.dockerfile
+      dockerfile: docker/airflow.Dockerfile
     pull_policy: missing
     container_name: airflow-init
     restart: "no"

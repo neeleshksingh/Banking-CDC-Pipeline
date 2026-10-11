@@ -15,10 +15,7 @@ from kafka import KafkaConsumer, OffsetAndMetadata, TopicPartition
 
 log = logging.getLogger("kafka_to_minio")
 
-# ============================================================
-# Configuration (read in main(); nothing connects at import time)
-# ============================================================
-
+# Settings are read in main(); nothing connects at import time.
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 
 TOPICS = [
@@ -33,10 +30,6 @@ DEFAULT_FLUSH_SECONDS = 10.0
 RETRY_BACKOFF_SECONDS = 5
 
 
-# ============================================================
-# Kafka helpers
-# ============================================================
-
 def deserialize(raw):
     # Tombstones (value=None) are disabled in the connector, but be defensive.
     return json.loads(raw.decode("utf-8")) if raw else None
@@ -48,10 +41,6 @@ def offset_meta(offset):
         return OffsetAndMetadata(offset, None, -1)
     return OffsetAndMetadata(offset, None)
 
-
-# ============================================================
-# Event -> flat record
-# ============================================================
 
 def to_record(message, event):
     """Flatten a Debezium envelope into one row with CDC metadata.
@@ -97,12 +86,7 @@ def event_date(record):
     return ts.strftime("%Y-%m-%d")
 
 
-# ============================================================
-# Write records to MinIO
-# ============================================================
-
 def write_to_minio(s3, bucket, table_name, records):
-
     if not records:
         return
 
@@ -112,50 +96,23 @@ def write_to_minio(s3, bucket, table_name, records):
         by_date.setdefault(event_date(record), []).append(record)
 
     for date_str, rows in by_date.items():
-
         df = pd.DataFrame(rows, dtype=object)
 
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
         file_name = f"{table_name}_{stamp}_{uuid.uuid4().hex[:6]}.parquet"
+        s3_key = f"{table_name}/date={date_str}/{file_name}"
 
-        s3_key = (
-            f"{table_name}/"
-            f"date={date_str}/"
-            f"{file_name}"
-        )
-
-        with tempfile.NamedTemporaryFile(
-            suffix=".parquet",
-            delete=False
-        ) as tmp:
-
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
             temp_file = tmp.name
 
         try:
-
-            df.to_parquet(
-                temp_file,
-                engine="fastparquet",
-                index=False
-            )
-
-            s3.upload_file(
-                temp_file,
-                bucket,
-                s3_key
-            )
-
+            df.to_parquet(temp_file, engine="fastparquet", index=False)
+            s3.upload_file(temp_file, bucket, s3_key)
             log.info("MinIO upload successful | %d record(s) | s3://%s/%s", len(rows), bucket, s3_key)
-
         finally:
-
             if os.path.exists(temp_file):
                 os.remove(temp_file)
 
-
-# ============================================================
-# Buffering + commit-after-write
-# ============================================================
 
 class MinioLander:
     """Buffers CDC events per table and lands them in MinIO.
@@ -210,24 +167,18 @@ class MinioLander:
             return
 
         try:
-
             write_to_minio(self.s3, self.bucket, table_name, buf["records"])
 
-            # ----------------------------------------------------
-            # IMPORTANT:
-            # Commit ONLY after MinIO upload succeeds.
-            # ----------------------------------------------------
+            # Commit only after the upload succeeded: a crash before this line
+            # re-reads the batch (at-least-once) instead of losing it.
             self.consumer.commit({
                 tp: offset_meta(offset + 1)
                 for tp, offset in buf["last_offsets"].items()
             })
-
             for tp, offset in buf["last_offsets"].items():
                 log.info("Kafka offset committed | %s | partition=%s | offset=%d", tp.topic, tp.partition, offset + 1)
-
         except Exception:
-
-            log.exception("Flush failed for %s", table_name)  # ERROR level, with traceback
+            log.exception("Flush failed for %s", table_name)
 
             # Rewind so the same events are re-read; nothing is skipped.
             for tp, offset in buf["first_offsets"].items():
@@ -237,9 +188,7 @@ class MinioLander:
                 "Kafka offset NOT committed. Rewound %s and retrying in %ss.", table_name, self.retry_backoff
             )
             self.sleep(self.retry_backoff)
-
         finally:
-
             self.buffers.pop(table_name, None)
 
     def flush_due(self):
@@ -276,24 +225,13 @@ class MinioLander:
         self.flush_all()
 
 
-# ============================================================
-# Wiring
-# ============================================================
-
 def make_consumer(bootstrap, group_id):
     return KafkaConsumer(
         *TOPICS,
-
         bootstrap_servers=bootstrap,
-
         auto_offset_reset="earliest",
-
-        # IMPORTANT:
-        # Kafka offsets are committed manually AFTER MinIO succeeds.
-        enable_auto_commit=False,
-
+        enable_auto_commit=False,  # MinioLander.flush commits after each upload
         group_id=group_id,
-
         value_deserializer=deserialize,
     )
 

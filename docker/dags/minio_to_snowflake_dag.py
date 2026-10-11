@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -13,20 +14,20 @@ from airflow.operators.python import PythonOperator
 from cryptography.hazmat.primitives import serialization
 from dotenv import load_dotenv
 
-# Load environment variables
+log = logging.getLogger(__name__)
+
 DAG_DIR = Path(__file__).resolve().parent
 ENV_FILE = DAG_DIR / ".env"
 
 load_dotenv(ENV_FILE, override=True)
 
-# -------- MinIO Config --------
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
 BUCKET = os.getenv("MINIO_BUCKET")
 LOCAL_DIR = os.getenv("MINIO_LOCAL_DIR", "/tmp/minio_downloads")
 
-# -------- Snowflake Config (key-pair auth, least-privilege role) --------
+# Snowflake: key-pair auth with the least-privilege pipeline role
 SNOWFLAKE_USER = os.getenv("SNOWFLAKE_USER")
 SNOWFLAKE_ROLE = os.getenv("SNOWFLAKE_ROLE")
 SNOWFLAKE_PRIVATE_KEY_PATH = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
@@ -53,7 +54,7 @@ PUT_OK = {"UPLOADED", "SKIPPED"}
 COPY_OK = {"LOADED", "LOAD_SKIPPED"}
 
 
-# -------- Pure helpers (no boto3 / Airflow / Snowflake calls; unit-tested) --------
+# Pure helpers below make no boto3 / Airflow / Snowflake calls, so they are unit-tested.
 def plan_table(objects, table_state, lookback=LOOKBACK):
     """Pick the keys to load for one table and compute its next watermark state.
 
@@ -135,7 +136,6 @@ def load_private_key(path, passphrase=None):
     )
 
 
-# -------- Python Callables --------
 def discover_and_download(**context):
     """Download only MinIO objects not loaded yet. Skips the run if none."""
     state = Variable.get(WATERMARK_VAR, default_var={}, deserialize_json=True)
@@ -168,7 +168,7 @@ def discover_and_download(**context):
             s3.download_file(BUCKET, key, str(local_file))
             files[table].append(str(local_file))
         total += len(files[table])
-        print(f"{table}: {len(files[table])} new file(s)")
+        log.info("%s: %d new file(s)", table, len(files[table]))
 
     if total == 0:
         # Nothing new: no Snowflake connection, so the warehouse can stay suspended.
@@ -200,15 +200,14 @@ def load_to_snowflake(**kwargs):
             cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS _loaded_at TIMESTAMP_LTZ")
 
             if not files:
-                print(f"No files for {table}, skipping.")
+                log.info("No files for %s, skipping.", table)
                 continue
 
             staged = []
             for f in files:
-                # PUT skips files that already exist in the stage.
                 rows = cur.execute(f"PUT 'file://{f}' @%{table}").fetchall()
                 staged.extend(check_put_results(table, rows_as_dicts(cur, rows)))
-            print(f"Uploaded {len(staged)} file(s) -> @%{table}")
+            log.info("Uploaded %d file(s) -> @%%%s", len(staged), table)
 
             # Only the files from this run; Snowflake load metadata also
             # skips any file this table has already loaded (idempotent).
@@ -229,10 +228,10 @@ def load_to_snowflake(**kwargs):
                 """).fetchall()
                 results = rows_as_dicts(cur, rows)
                 for r in results:
-                    print(f"COPY {table}: {r}")
+                    log.info("COPY %s: %s", table, r)
                 failures.extend(copy_failures(table, results))
 
-            print(f"Data loaded into {table}")
+            log.info("Data loaded into %s", table)
     finally:
         cur.close()
         conn.close()
@@ -247,7 +246,6 @@ def load_to_snowflake(**kwargs):
     shutil.rmtree(payload["run_dir"], ignore_errors=True)
 
 
-# -------- Airflow DAG --------
 default_args = {
     "owner": "airflow",
     "retries": 1,

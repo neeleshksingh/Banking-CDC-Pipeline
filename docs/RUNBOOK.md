@@ -22,7 +22,7 @@ All commands run from the repository root unless stated otherwise.
 | What | Check |
 |---|---|
 | Docker Desktop running | `docker info` |
-| Python venv with dependencies | `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` |
+| Python 3.11 venv with dependencies (same version as CI and the consumer image; dbt 1.12 needs ≥ 3.10) | `python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt` (macOS: `brew install python@3.11`) |
 | Env files present | `.env`, `data-generator/.env`, `kafka-debezium/.env`, `consumer/.env`, `docker/dags/.env` (copy each `.env.example` and fill it in) |
 | Snowflake key pair | `keys/snowflake_rsa_key.p8` attached to `BANKING_PIPELINE_USER` (section 0b) |
 | dbt profile | `banking_dbt/.dbt/profiles.yml`, key-pair version from [`banking_dbt/README.md`](../banking_dbt/README.md) |
@@ -47,15 +47,15 @@ Airflow and dbt log in as the service user `BANKING_PIPELINE_USER` with a privat
 
    Run the printed `ALTER USER BANKING_PIPELINE_USER SET RSA_PUBLIC_KEY = '...';` in Snowsight, then check
    that `describe user BANKING_PIPELINE_USER` shows an `RSA_PUBLIC_KEY_FP`.
-3. **One-time ownership transfer.** Tables and views created so far belong to `ACCOUNTADMIN`. Review and run
-   the commented `grant ownership ... copy current grants` block (section 7) in `security_setup.sql`.
-   Without it, `PUT` into `@%table`, `ALTER TABLE` and dbt's `create or replace` fail with
-   "Insufficient privileges".
+3. **Only if `BANKING` already has tables or views** created by another role (e.g. `ACCOUNTADMIN`): review
+   and run the commented `grant ownership ... copy current grants` block (section 7) in
+   `security_setup.sql`. Without it, `PUT` into `@%table`, `ALTER TABLE` and dbt's `create or replace` fail
+   with "Insufficient privileges". A fresh database doesn't need it.
 4. In `docker/dags/.env`: set `SNOWFLAKE_USER=BANKING_PIPELINE_USER`, `SNOWFLAKE_ROLE=BANKING_PIPELINE_ROLE`,
-   `SNOWFLAKE_PRIVATE_KEY_PATH=/opt/airflow/keys/snowflake_rsa_key.p8`, an empty
-   `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE=`, and delete `SNOWFLAKE_PASSWORD` (see `docker/dags/.env.example`).
-5. Replace `banking_dbt/.dbt/profiles.yml` with the key-pair profile in
-   [`banking_dbt/README.md`](../banking_dbt/README.md) (`private_key_path`, `role`; no `password`).
+   `SNOWFLAKE_PRIVATE_KEY_PATH=/opt/airflow/keys/snowflake_rsa_key.p8` and an empty
+   `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE=` (see `docker/dags/.env.example`).
+5. Create `banking_dbt/.dbt/profiles.yml` from the key-pair profile in
+   [`banking_dbt/README.md`](../banking_dbt/README.md).
 6. Recreate the Airflow containers so they pick up the env file and the `./keys` mount (read-only at
    `/opt/airflow/keys`): `docker compose up -d --force-recreate airflow-webserver airflow-scheduler`.
 
@@ -76,8 +76,8 @@ make snowflake-keys KEY_NAME=snowflake_ci_key SF_USER=BANKING_CI_USER   # run th
 | `SNOWFLAKE_WAREHOUSE` | `COMPUTE_WH` |
 | `SNOWFLAKE_PRIVATE_KEY` | full contents of `keys/snowflake_ci_key.p8`, including the `BEGIN` / `END` lines |
 
-`SNOWFLAKE_PASSWORD` and `SNOWFLAKE_USER` are no longer used by the workflows and can be deleted. CI needs no
-secrets at all.
+CI needs no secrets at all. CD runs only when `banking_dbt/` or `cd.yml` changes on `main` (or by hand from
+the Actions tab).
 
 ---
 
@@ -164,18 +164,11 @@ LOG_LEVEL=INFO .venv/bin/python consumer/kafka_to_minio.py
 
 It reads `consumer/.env` (`localhost:29092`, `http://localhost:9000`). `Ctrl+C` flushes and exits.
 
-> The previous consumer never committed offsets (a kafka-python API mismatch), so on its first start this
-> version re-reads everything still retained in Kafka (7 days). That's expected: duplicates are removed in
-> dbt staging.
-
 ---
 
-## 5. One-time Snowflake cleanup and first dbt build
+## 5. First dbt build
 
-1. In Snowsight, run [`snowflake/cleanup_legacy_objects.sql`](../snowflake/cleanup_legacy_objects.sql).
-   It drops only derived objects left by older versions (marts built in `RAW`, and the old-layout
-   `ANALYTICS.FACT_TRANSACTIONS`). RAW tables and SCD2 snapshots are **not** touched.
-2. Run the first build with the same dbt version Airflow uses:
+Run it inside the Airflow container, so it uses the same dbt version as the scheduled builds:
 
 ```bash
 docker exec airflow-scheduler bash -c "cd /opt/airflow/banking_dbt && dbt build --full-refresh \
@@ -291,7 +284,96 @@ The `load_snowflake` log shows `LOAD_SKIPPED ... File was loaded before`, and RA
 
 ---
 
-## 11. Full resync (if Snowflake is missing rows that Postgres has)
+## 11. Power BI report
+
+The report runs in the Power BI service in a browser (works on macOS), in **Import** mode on
+`BANKING.ANALYTICS`. Screenshots: [`docs/images/powerbi/`](images/powerbi/).
+
+**11a. Snowflake access (once).**
+
+1. In Snowsight, as `ACCOUNTADMIN`, run [`snowflake/powerbi_setup.sql`](../snowflake/powerbi_setup.sql)
+   ("Run All"). It creates the read-only role `PBI_READER`, the auto-suspending warehouse `PBI_WH`, and the
+   service user `PBI_SVC`.
+2. Create a key for `PBI_SVC` and run the printed `ALTER USER` in Snowsight:
+
+   ```bash
+   make snowflake-keys KEY_NAME=snowflake_pbi_key SF_USER=PBI_SVC
+   ```
+
+   Power BI signs in with this key because scheduled refresh can't answer an MFA prompt.
+
+**11b. Connect (app.powerbi.com).** You need a work or school account (Gmail / Outlook.com are not accepted)
+with Pro or a trial.
+
+1. Workspace → **+ New item → Semantic model → Get data → Snowflake**.
+2. **Server:** `<SNOWFLAKE_ACCOUNT>.snowflakecomputing.com` (value from `docker/dags/.env`) · **Warehouse:**
+   `PBI_WH` · **Advanced options → Role:** `PBI_READER`.
+3. **Credentials:** no gateway · **Authentication kind:** Key pair · **Username:** `PBI_SVC` · **Private key:**
+   the full contents of `keys/snowflake_pbi_key.p8` including the `BEGIN` / `END` lines
+   (`pbcopy < keys/snowflake_pbi_key.p8` copies it) · passphrase empty.
+4. Under `BANKING → ANALYTICS` select `FACT_TRANSACTIONS`, `DIM_CUSTOMERS`, `DIM_ACCOUNTS`, `DIM_DATE`,
+   `DIM_CUSTOMERS_HISTORY`, `FCT_CDC_EVENTS`, `MON_PIPELINE_FRESHNESS` → **Create** → **Create a semantic model
+   only**.
+
+**11c. Model** (open the semantic model, switch **Viewing → Editing**; edits save immediately, and
+**Version history** restores older versions).
+
+1. **Model options:** turn off *Auto date/time* and *Autodetect new relationships*; delete any relationships
+   Power BI created.
+2. **Manage relationships → New**, all *many to one*, cross-filter *single*:
+
+   | # | From (many) | To (one) | Active |
+   |---|---|---|---|
+   | 1 | `FACT_TRANSACTIONS[TRANSACTION_DATE]` | `DIM_DATE[DATE]` | yes |
+   | 2 | `FACT_TRANSACTIONS[ACCOUNT_ID]` | `DIM_ACCOUNTS[ACCOUNT_ID]` | yes |
+   | 3 | `DIM_ACCOUNTS[CUSTOMER_ID]` | `DIM_CUSTOMERS[CUSTOMER_ID]` | yes |
+   | 4 | `DIM_CUSTOMERS_HISTORY[CUSTOMER_ID]` | `DIM_CUSTOMERS[CUSTOMER_ID]` | yes |
+   | 5 | `FACT_TRANSACTIONS[RELATED_ACCOUNT_ID]` | `DIM_ACCOUNTS[ACCOUNT_ID]` | **no** (used by `Transfer In Value`) |
+
+   Customer filters flow customer → accounts → transactions along one path. `FCT_CDC_EVENTS` and
+   `MON_PIPELINE_FRESHNESS` stay unconnected.
+3. Right-click `DIM_DATE` → **Mark as date table** → column `DATE`.
+4. **Properties:** *Summarize by: None* on ID columns; *Sort by column* `MONTH_NAME` → `MONTH_NUM`,
+   `YEAR_MONTH` → `YEAR_MONTH_NUM`, `DAY_NAME` → `DAY_OF_WEEK_NUM`, `AMOUNT_BAND` → `AMOUNT_BAND_ORDER`,
+   `BALANCE_BAND` → `BALANCE_BAND_ORDER`; currency format on `AMOUNT` and `BALANCE`.
+
+**11d. Measures.** Workspace → semantic model **⋯ → Write DAX queries** → paste
+[`powerbi/measures.dax`](../powerbi/measures.dax) → **Update model with changes** (adds all 49 measures) →
+**Run** (the two result grids are a self-test). Then set formats in the model editor: currency for values
+and balances, percentage for `%` measures, whole number for counts.
+
+**11e. Check the numbers.** Run [`snowflake/powerbi_expected_values.sql`](../snowflake/powerbi_expected_values.sql)
+in Snowsight. `Transaction Count`, `Transaction Value`, `Failure Rate %`, `Customer Count`, `Account Count`
+and `Total Balance` must equal the first result grid from 11d. If not, refresh the model first; if they still
+differ, a relationship is wrong.
+
+**11f. Report pages.** Semantic model → **New report**.
+
+| Page | Visuals |
+|---|---|
+| Overview | KPI cards, daily value + count trend, value by transaction type, top 10 customers, date slicer |
+| Transactions | daily value by type, failure share by type, transactions by UTC hour, amount distribution, transfers between account types, largest transactions |
+| Customers | KPI cards, value vs activity scatter, segments by `ACCOUNT_MIX`, new customers over time, customer list |
+| Accounts | KPI cards, current balance by account type, balance distribution, account ledger with transfers in/out |
+| Pipeline Health | freshness and latency cards, CDC events per load day, events by source table, RAW events vs mart rows, data-quality cards (all 0) |
+| Customer Detail | hidden drill-through on `CUSTOMER_LABEL`: accounts, transactions, SCD2 email history |
+
+Sync the date slicer across the first four pages (**View → Sync slicers**); Pipeline Health has none.
+Balances are current values, so the date slicer doesn't change them.
+
+**11g. Scheduled refresh.** Semantic model **⋯ → Settings → Data source credentials** (key pair, as in 11b)
+→ **Refresh → Configure a refresh schedule** (Pro allows 8 per day).
+
+**11h. End-to-end check.** Run test A (with amount `9999.99`) and test B from step 10, wait ~4 min, then
+semantic model **⋯ → Refresh now**: the deposit tops *Largest transactions*, customer #1's Customer Detail
+page shows the new email version, and Pipeline Health shows `Fresh`.
+
+The dashboard is as fresh as its last refresh: the pipeline is near-real-time (2–4 min to Snowflake), the
+report is not.
+
+---
+
+## 12. Full resync (if Snowflake is missing rows that Postgres has)
 
 This forces Debezium to re-snapshot every table; dbt de-duplicates the resulting events.
 
@@ -303,7 +385,7 @@ Keep using the new name (`CONNECTOR_NAME=banking-cdc-connector-v2`) for later ru
 
 ---
 
-## 12. Stop
+## 13. Stop
 
 1. `Ctrl+C` the generator. The consumer container flushes and commits on `docker compose stop` (SIGTERM);
    a host-run consumer does the same on `Ctrl+C`.
@@ -318,12 +400,17 @@ Keep using the new name (`CONNECTOR_NAME=banking-cdc-connector-v2`) for later ru
 |---|---|
 | `kafka` keeps restarting with `NodeExists` | Previous broker session still in ZooKeeper; it clears within ~20 s. If it persists: `docker compose restart zookeeper kafka` |
 | Connector task `FAILED` | `curl localhost:8083/connectors/banking-cdc-connector/status` for the trace; then re-run step 3 |
-| `fact_transactions was built by an older version of this model` | Run step 5 (cleanup + `--full-refresh`) |
+| `fact_transactions was built by an older version of this model` | Run the `--full-refresh` build from step 5 |
 | `load_snowflake` fails with `SignatureDoesNotMatch` | MinIO keys in `docker/dags/.env` don't match the MinIO root user |
 | `Could not connect to Snowflake backend` | Network/DNS from Docker; the task retries once. Re-trigger the DAG |
 | `Snowflake private key not found at ...` | `keys/` is missing or not mounted: run `make snowflake-keys`, then recreate the Airflow containers (step 0b) |
 | `JWT token is invalid` / `Failed to authenticate` | The public key on the user doesn't match the private key: re-run the printed `ALTER USER ... SET RSA_PUBLIC_KEY` |
-| `Insufficient privileges` / `does not exist or not authorized` | Existing objects are still owned by `ACCOUNTADMIN`: run the ownership transfer (step 0b.3) |
+| `Insufficient privileges` / `does not exist or not authorized` | Existing objects are owned by another role: run the ownership transfer (step 0b.3) |
+| Power BI: Snowflake sign-in fails | Server must end in `.snowflakecomputing.com`; user `PBI_SVC`, role `PBI_READER`, warehouse `PBI_WH`; the pasted key needs its `BEGIN` / `END` lines; `describe user PBI_SVC` must show `RSA_PUBLIC_KEY_FP` |
+| Power BI: totals too high | An extra relationship exists (e.g. `FACT_TRANSACTIONS[CUSTOMER_ID]` → `DIM_CUSTOMERS`): keep exactly the 5 in 11c |
+| Power BI: `Transfer In Value` blank | Relationship 5 is missing or active |
+| Power BI: no **Write DAX queries** / can't switch to Editing | Workspace settings → enable *Users can edit data models in the Power BI service* |
+| Power BI: scheduled refresh fails | Semantic model settings → Data source credentials → re-enter the key; check that `PBI_WH` exists |
 | `load_snowflake` fails with `COPY failed for N file(s)` | The log names each file and Snowflake's `first_error`. Fix or remove the file in MinIO; the watermark only moves once every file loads |
 | `consumer` never starts | It waits for Kafka and MinIO to be healthy: `docker compose ps` and `docker compose logs minio kafka` |
 | dbt test failure in `dbt_build` | Open the task log. Downstream models are skipped, so bad data never reaches the marts |
