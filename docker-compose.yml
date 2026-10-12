@@ -32,6 +32,10 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    # Named volumes survive `docker compose down` (only `down -v` removes them).
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
 
   kafka:
     image: confluentinc/cp-kafka:7.4.1
@@ -50,6 +54,9 @@ services:
     ports:
       - "9092:9092"
       - "29092:29092"
+    # Topics, consumer offsets and Kafka Connect's connector config/offsets live here.
+    volumes:
+      - kafka_data:/var/lib/kafka/data
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
@@ -74,6 +81,10 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+        # Restart Connect whenever Compose restarts/recreates Kafka. A Connect worker left
+        # running against a fresh broker makes it auto-create connect-* with
+        # cleanup.policy=delete, and Connect then refuses to start.
+        restart: true
       postgres:
         condition: service_healthy
     healthcheck:
@@ -94,6 +105,24 @@ services:
       VALUE_CONVERTER_SCHEMAS_ENABLE: 'false'
       KEY_CONVERTER: 'org.apache.kafka.connect.json.JsonConverter'
       VALUE_CONVERTER: 'org.apache.kafka.connect.json.JsonConverter'
+
+  # One-shot: creates or updates the Debezium connector once Connect is healthy,
+  # so a fresh Kafka (e.g. after `down -v`) starts streaming without a manual step.
+  # Idempotent (PUT): an existing connector keeps its stored offsets.
+  connector-register:
+    build:
+      context: ./kafka-debezium
+    image: banking-connector-register:latest
+    container_name: connector-register
+    restart: "no"
+    # Postgres credentials (and optional CONNECTOR_NAME) from kafka-debezium/.env
+    env_file:
+      - ./kafka-debezium/.env
+    environment:
+      CONNECT_URL: http://connect:8083
+    depends_on:
+      connect:
+        condition: service_healthy
 
   postgres:
     image: postgres:15
@@ -225,6 +254,9 @@ services:
 volumes:
   airflow_postgres_data:
   postgres_data:
+  zookeeper_data:
+  zookeeper_log:
+  kafka_data:
 networks:
   default:
     name: banking-mds-net

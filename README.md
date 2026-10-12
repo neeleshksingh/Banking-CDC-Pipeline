@@ -160,7 +160,7 @@ consumer/            kafka_to_minio.py: Kafka → MinIO Parquet writer; Dockerfi
 data-generator/      faker_generator.py: balance-aware banking simulator (live + backfill)
 docker/              airflow.Dockerfile (Airflow + dbt); dags/: minio_to_snowflake_dag.py, dbt_banking_build.py
 docs/                RUNBOOK.md (run, test, Power BI setup), images/powerbi/ (report screenshots)
-kafka-debezium/      register_connector.py: creates/updates the Debezium connector
+kafka-debezium/      register_connector.py: creates/updates the Debezium connector (run on startup by the connector-register service)
 postgres/            schema.sql: source DDL (constraints, indexes, CDC settings)
 powerbi/             measures.dax (all report measures, pasted into the model in one step)
 snowflake/           security_setup.sql (roles, service users), powerbi_setup.sql, verification SQL

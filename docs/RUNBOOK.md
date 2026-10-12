@@ -90,7 +90,8 @@ docker compose ps -a
 ```
 
 Wait until `postgres`, `kafka`, `connect` and `minio` show **healthy**, `consumer` is **running**, and
-`airflow-init` shows **exited (0)**.
+`airflow-init` and `connector-register` show **exited (0)**. `connector-register` registers the Debezium
+connector automatically (section 3).
 Kafka may restart once or twice with `NodeExists` right after a restart; the restart policy recovers it
 within ~30 s.
 
@@ -119,11 +120,19 @@ You should see the `updated_at` column, the `transactions_*_check` constraints a
 
 ## 3. Register (or update) the Debezium connector
 
+The one-shot `connector-register` service does this on every `docker compose up` once Connect is healthy,
+using `kafka-debezium/.env`. Check it:
+
+```bash
+docker logs connector-register
+```
+
+Expect `Connector 'banking-cdc-connector' created` (or `config updated`) and `RUNNING`. To run it by hand
+(e.g. with `--replace`):
+
 ```bash
 cd kafka-debezium && ../.venv/bin/python register_connector.py && cd ..
 ```
-
-Expect `Connector 'banking-cdc-connector' created` (or `config updated`) and `RUNNING`.
 
 If it stops with `Connector '...' already uses replication slot 'banking_slot'`, an older connector
 (e.g. `banking-postgres-connector`) owns the slot. Replace it:
@@ -384,7 +393,8 @@ This forces Debezium to re-snapshot every table; dbt de-duplicates the resulting
 cd kafka-debezium && CONNECTOR_NAME=banking-cdc-connector-v2 ../.venv/bin/python register_connector.py --replace && cd ..
 ```
 
-Keep using the new name (`CONNECTOR_NAME=banking-cdc-connector-v2`) for later runs of that script.
+Then set `CONNECTOR_NAME=banking-cdc-connector-v2` in `kafka-debezium/.env`, so later manual runs and the
+`connector-register` service keep using the new name.
 
 ---
 
@@ -392,8 +402,10 @@ Keep using the new name (`CONNECTOR_NAME=banking-cdc-connector-v2`) for later ru
 
 1. `Ctrl+C` the generator. The consumer container flushes and commits on `docker compose stop` (SIGTERM);
    a host-run consumer does the same on `Ctrl+C`.
-2. `docker compose stop` keeps containers, Kafka topics and connector offsets.
-   Avoid `docker compose down` unless you want a clean Kafka; the next start will then re-snapshot.
+2. `docker compose stop` or `docker compose down` both keep Kafka topics, consumer offsets and the connector:
+   ZooKeeper and Kafka use named volumes (`zookeeper_data`, `zookeeper_log`, `kafka_data`).
+   `docker compose down -v` deletes those volumes, giving a clean Kafka. The next `up` re-registers the
+   connector, which re-snapshots every table (dbt de-duplicates).
 
 ---
 
