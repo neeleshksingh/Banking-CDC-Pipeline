@@ -8,6 +8,8 @@
 ![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)
 
+**Demo video:** [Watch on YouTube](https://youtu.be/48AUT9PBtKI?si=V7ekCxp8tfcVjDmQ)
+
 A change-data-capture (CDC) pipeline for a simulated bank. Every insert, update and delete in a Postgres
 database is captured from the write-ahead log, landed in object storage, loaded into Snowflake and modelled
 with dbt into a tested star schema with SCD Type-2 history. A Power BI report sits on top.
